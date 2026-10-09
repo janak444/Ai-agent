@@ -1,7 +1,6 @@
 import os
 import glob
 import json
-import httpx2
 import threading
 import subprocess
 import customtkinter as ctk
@@ -9,9 +8,19 @@ from tkinter import filedialog, messagebox
 from PIL import Image, ImageTk
 import base64
 from io import BytesIO
-import whisper
-import pyaudio
-import numpy as np
+
+# Lazy import for heavy libraries to prevent startup freeze
+def get_whisper():
+    import whisper
+    return whisper
+
+def get_pyaudio():
+    import pyaudio
+    return pyaudio
+
+def get_numpy():
+    import numpy as np
+    return np
 
 # Configuration
 OLLAMA_URL = "http://localhost:11434/api/chat"
@@ -33,7 +42,6 @@ class AgenticMimoIDE(ctk.CTk):
         self.current_open_file = None
         self.attached_image_path = None
         self.project_root = os.getcwd()
-        self.whisper_model = None
 
         self.models_inventory = {
             "qwen3-coder:30b": "Qwen 3 Coder (30B)",
@@ -76,9 +84,6 @@ class AgenticMimoIDE(ctk.CTk):
         self.files_container.grid(row=5, column=0, padx=10, pady=10, sticky="nsew")
         self.update_files_list()
 
-        # Load Whisper model in background to avoid startup delay
-        threading.Thread(target=self._load_whisper_model, daemon=True).start()
-
         # --- MAIN CONTENT AREA ---
         self.main_container = ctk.CTkFrame(self, fg_color="transparent")
         self.main_container.grid(row=0, column=1, sticky="nsew", padx=20, pady=20)
@@ -101,11 +106,8 @@ class AgenticMimoIDE(ctk.CTk):
         self.img_button = ctk.CTkButton(self.input_frame, text="🖼️ Image", width=80, height=50, fg_color="gray30", command=self.upload_image)
         self.img_button.grid(row=0, column=1, padx=(0, 10))
 
-        self.voice_button = ctk.CTkButton(self.input_frame, text="🎙️ Voice", width=80, height=50, fg_color="gray30", command=self.capture_voice)
-        self.voice_button.grid(row=0, column=2, padx=(0, 10))
-
         self.send_button = ctk.CTkButton(self.input_frame, text="Execute Goal", width=120, height=50, command=self.send_request, font=ctk.CTkFont(weight="bold"))
-        self.send_button.grid(row=0, column=3)
+        self.send_button.grid(row=0, column=2)
 
     def resolve_path(self, path):
         """Resolves a path relative to the project root and validates it's within the root."""
@@ -123,67 +125,6 @@ class AgenticMimoIDE(ctk.CTk):
             self.project_root = path
             self.append_chat(f"⚙️ [SYSTEM]: Project root changed to {path}\n", tag="system")
             self.update_files_list()
-
-    def _load_whisper_model(self):
-        \"\"\"Loads the Whisper model in the background.\"\"\"
-        try:
-            self.whisper_model = whisper.load_model("base")
-            self.after(0, lambda: self.append_chat("⚙️ [SYSTEM]: Voice model loaded and ready.", tag="system"))
-        except Exception as e:
-            self.after(0, lambda: self.append_chat(f"❌ Voice model failed to load: {str(e)}", tag="system"))
-
-    def capture_voice(self):
-        """Entry point for voice recording."""
-        self.voice_button.configure(text="Listening...", fg_color="red")
-        threading.Thread(target=self._voice_worker, daemon=True).start()
-
-    def _voice_worker(self):
-        """Background thread to handle audio capture and transcription."""
-        try:
-            # Audio Configuration
-            CHUNK = 1024
-            FORMAT = pyaudio.paInt16
-            CHANNELS = 1
-            RATE = 16000
-            RECORD_SECONDS = 5
-
-            p = pyaudio.PyAudio()
-            stream = p.open(format=FORMAT, channels=CHANNELS, rate=RATE, input=True, frames_per_buffer=CHUNK)
-
-            frames = []
-            for _ in range(0, int(RATE / CHUNK * RECORD_SECONDS)):
-                data = stream.read(CHUNK)
-                frames.append(data)
-
-            stream.stop_stream()
-            stream.close()
-            p.terminate()
-
-            # Convert audio bytes to float32 numpy array for Whisper
-            audio_bytes = b''.join(frames)
-            audio_np = np.frombuffer(audio_bytes, dtype=np.int16).astype(np.float32) / 32768.0
-
-            # Local transcription using the pre-loaded Whisper model
-            if self.whisper_model is None:
-                # Fallback if model hasn't loaded yet
-                model = whisper.load_model("base")
-            else:
-                model = self.whisper_model
-
-            result = model.transcribe(audio_np)
-            text = result.get("text", "").strip()
-
-            if text:
-                self.after(0, lambda: self.user_input.insert(0, text))
-                self.after(0, self.send_request)
-            else:
-                self.after(0, lambda: self.append_chat("⚠️ No speech detected.", tag="system"))
-
-        except Exception as e:
-            self.after(0, lambda: messagebox.showerror("Voice Error", f"Could not capture voice: {str(e)}"))
-
-        finally:
-            self.after(0, lambda: self.voice_button.configure(text="🎙️ Voice", fg_color="gray30"))
 
     def change_model(self, choice):
         for key, val in self.models_inventory.items():
