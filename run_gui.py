@@ -29,6 +29,7 @@ class AgenticMimoIDE(ctk.CTk):
         self.is_generating = False
         self.current_open_file = None
         self.attached_image_path = None
+        self.project_root = os.getcwd()
 
         self.models_inventory = {
             "qwen3-coder:30b": "Qwen 3 Coder (30B)",
@@ -61,11 +62,14 @@ class AgenticMimoIDE(ctk.CTk):
         )
         self.model_dropdown.grid(row=2, column=0, padx=20, pady=10)
 
-        self.files_label = ctk.CTkLabel(self.sidebar, text="Workspace Files (Click to Open):")
+        self.files_label = ctk.CTkLabel(self.sidebar, text="Project Files (Click to Open):")
         self.files_label.grid(row=3, column=0, padx=20, pady=(20, 0), sticky="nw")
 
+        self.project_btn = ctk.CTkButton(self.sidebar, text="📁 Open Project", fg_color="#3b3b3b", command=self.select_project_folder)
+        self.project_btn.grid(row=4, column=0, padx=20, pady=10)
+
         self.files_container = ctk.CTkScrollableFrame(self.sidebar, width=220)
-        self.files_container.grid(row=4, column=0, padx=10, pady=10, sticky="nsew")
+        self.files_container.grid(row=5, column=0, padx=10, pady=10, sticky="nsew")
         self.update_files_list()
 
         # --- MAIN CONTENT AREA ---
@@ -93,6 +97,23 @@ class AgenticMimoIDE(ctk.CTk):
         self.send_button = ctk.CTkButton(self.input_frame, text="Execute Goal", width=120, height=50, command=self.send_request, font=ctk.CTkFont(weight="bold"))
         self.send_button.grid(row=0, column=2)
 
+    def resolve_path(self, path):
+        """Resolves a path relative to the project root and validates it's within the root."""
+        absolute_root = os.path.abspath(self.project_root)
+        absolute_path = os.path.abspath(os.path.join(absolute_root, path))
+
+        if os.path.commonpath([absolute_root, absolute_path]) != absolute_root:
+            raise PermissionError(f"Access denied: {path} is outside the project root.")
+
+        return absolute_path
+
+    def select_project_folder(self):
+        path = filedialog.askdirectory()
+        if path:
+            self.project_root = path
+            self.append_chat(f"⚙️ [SYSTEM]: Project root changed to {path}\n", tag="system")
+            self.update_files_list()
+
     def change_model(self, choice):
         for key, val in self.models_inventory.items():
             if val == choice:
@@ -103,15 +124,31 @@ class AgenticMimoIDE(ctk.CTk):
     def update_files_list(self):
         for widget in self.files_container.winfo_children():
             widget.destroy()
-        files = [f for f in glob.glob("*") if os.path.isfile(f) and f not in ["run_gui.py", "run_agent.py"]]
-        for file in sorted(files):
+
+        files_to_show = []
+        # Skip common large/hidden directories
+        skip_dirs = {'.git', '.vscode', '__pycache__', 'node_modules', 'venv', '.idea'}
+
+        for root, dirs, files in os.walk(self.project_root):
+            # Modify dirs in-place to skip them in recursive walk
+            dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+
+            for file in files:
+                if file.startswith('.'): continue
+                # Get path relative to project_root
+                rel_path = os.path.relpath(os.path.join(root, file), self.project_root)
+                if rel_path not in ["run_gui.py", "run_agent.py"]:
+                    files_to_show.append(rel_path)
+
+        for file in sorted(files_to_show):
             btn = ctk.CTkButton(self.files_container, text=file, fg_color="transparent", text_color=("gray10", "gray90"), anchor="w", command=lambda f=file: self.open_file(f))
             btn.pack(fill="x", pady=2)
 
     def open_file(self, filename):
         self.current_open_file = filename
         try:
-            with open(filename, 'r') as f:
+            full_path = self.resolve_path(filename)
+            with open(full_path, 'r') as f:
                 content = f.read()
             self.append_chat(f"\n📖 OPENING FILE: {filename}\n" + "-"*30 + f"\n{content}\n" + "-"*30 + "\n", tag="system")
             self.append_chat(f"💡 Context: The user is now focusing on {filename}.\n", tag="system")
@@ -143,22 +180,18 @@ class AgenticMimoIDE(ctk.CTk):
     def describe_image(self, path):
         """Uses a vision model to convert image to a detailed technical description."""
         b64_image = self.image_to_base64(path)
+        # Vision models in Ollama typically use /api/generate instead of /api/chat
         payload = {
             "model": VISION_MODEL,
-            "messages": [
-                {
-                    "role": "user",
-                    "content": "Describe this image in extreme technical detail. If it's a screenshot of code or an error, extract the exact text. If it's a design, describe the layout and components. Be precise.",
-                    "images": [b64_image]
-                }
-            ],
+            "prompt": "Describe this image in extreme technical detail. If it's a screenshot of code or an error, extract the exact text. If it's a design, describe the layout and components. Be precise.",
+            "images": [b64_image],
             "stream": False
         }
         try:
             with httpx2.Client(timeout=120.0) as client:
-                response = client.post(OLLAMA_URL, json=payload)
+                response = client.post(f"{OLLAMA_URL.replace('/api/chat', '/api/generate')}", json=payload)
                 response.raise_for_status()
-                return response.json()["message"]["content"]
+                return response.json().get("response", "No description returned.")
         except Exception as e:
             return f"Error describing image: {str(e)}"
 
@@ -188,22 +221,28 @@ class AgenticMimoIDE(ctk.CTk):
             self.after(0, lambda: self.img_button.configure(fg_color="gray30"))
 
         system_prompt = (
-            "You are an Autonomous AI Software Engineer with Vision capabilities. "
+            f"You are an Autonomous AI Software Engineer. Your active brain is {self.selected_model}. "
             "You solve tasks by cycling through: Thought, Action, and Observation.\n\n"
+            f"Your current project root is: {self.project_root}. All file paths provided to tools should be relative to this root.\n\n"
+            "IMPORTANT: You are equipped with a Vision Assistant. While you cannot 'see' images directly, "
+            "any text provided as a 'Visual Analysis' or 'Observation' is a factual description of an image "
+            "you have been given. TRUST THIS INFORMATION as if you saw the image yourself.\n\n"
             "AVAILABLE TOOLS:\n"
             "1. read_file(path): Returns content of a file.\n"
             "2. write_file(path, content): Writes content to a file.\n"
             "3. execute_command(command): Runs a shell command and returns output.\n"
-            "4. list_files(): Lists files in current directory.\n\n"
+            "4. list_files(): Lists all files in the project recursively.\n\n"
             "STRATEGY:\n"
-            "- Use visual descriptions provided as 'Observations' to debug UI or fix errors from screenshots.\n"
-            "- If you have enough info, go straight to 'Final Answer'.\n"
-            "- Otherwise, use 'Thought -> Action'.\n\n"
+            "- If you have the answer in the provided Visual Analysis or history, use it immediately.\n"
+            "- If you need to explore or verify, use the 'Thought -> Action' cycle.\n"
+            "- Be concise in your thoughts.\n\n"
             "CRITICAL FORMATTING:\n"
+            "You MUST use the following tags:\n"
             "Thought: <reasoning>\n"
-            "Action: <tool_name>(<args>)\n"
-            "OR\n"
-            "Final Answer: <result>"
+            "Action: <tool_name>(<args>)\n\n"
+            "If you have the answer or just want to talk to the user, use:\n"
+            "Final Answer: <your response>\n\n"
+            "If you do not provide a 'Thought' and 'Action', or a 'Final Answer', the system will fail."
         )
 
         current_history = [{"role": "system", "content": system_prompt}]
@@ -223,7 +262,7 @@ class AgenticMimoIDE(ctk.CTk):
             self.append_chat(f"\n--- Iteration {iteration} ---\n", tag="system")
 
             try:
-                payload = {"model": self.selected_model, "messages": current_history, "stream": False, "options": {"temperature": 0.1}}
+                payload = {"model": self.selected_model, "messages": current_history, "stream": False, "options": {"temperature": 0.0}}
                 with httpx2.Client(timeout=900.0) as client:
                     response = client.post(OLLAMA_URL, json=payload)
                     response.raise_for_status()
@@ -266,20 +305,30 @@ class AgenticMimoIDE(ctk.CTk):
         try:
             if "read_file" in call:
                 path = call.split("(")[1].split(")")[0].strip("'\"")
-                with open(path, 'r') as f: return f.read()
+                full_path = self.resolve_path(path)
+                with open(full_path, 'r') as f: return f.read()
             elif "write_file" in call:
                 parts = call.split("(", 1)[1].rsplit(")", 1)[0].split(",", 1)
                 path = parts[0].strip("'\"")
                 content = parts[1].strip("'\"")
-                with open(path, 'w') as f: f.write(content)
+                full_path = self.resolve_path(path)
+                with open(full_path, 'w') as f: f.write(content)
                 self.update_files_list()
                 return "File written successfully."
             elif "execute_command" in call:
                 cmd = call.split("(")[1].split(")")[0].strip("'\"")
-                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60)
+                # Note: We use the current project_root as the CWD for the command
+                result = subprocess.run(cmd, shell=True, capture_output=True, text=True, timeout=60, cwd=self.project_root)
                 return f"STDOUT: {result.stdout}\nSTDERR: {result.stderr}"
             elif "list_files" in call:
-                return str([f for f in glob.glob("*") if os.path.isfile(f)])
+                files_to_list = []
+                skip_dirs = {'.git', '.vscode', '__pycache__', 'node_modules', 'venv', '.idea'}
+                for root, dirs, files in os.walk(self.project_root):
+                    dirs[:] = [d for d in dirs if d not in skip_dirs and not d.startswith('.')]
+                    for file in files:
+                        if file.startswith('.'): continue
+                        files_to_list.append(os.path.relpath(os.path.join(root, file), self.project_root))
+                return str(sorted(files_to_list))
             return "Unknown tool."
         except Exception as e:
             return f"Tool Error: {str(e)}"
