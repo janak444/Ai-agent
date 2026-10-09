@@ -10,38 +10,53 @@ def scan_workspace():
     files = [f for f in glob.glob("*") if os.path.isfile(f) and f != "run_agent.py"]
     return files
 
-def prompt_local_model(model_name, task):
-    """Sends the execution string straight to the selected local Ollama core."""
+def prompt_local_model(model_name, task, history=None):
+    """Sends the execution string to the selected local Ollama core with streaming enabled."""
+    if history is None:
+        history = []
+
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                "You are an expert autonomous software engineer and data architect agent. "
+                "When building complex software systems, output the complete, functional python "
+                "source code enclosed inside a clean ```python markdown block."
+            )
+        }
+    ]
+
+    messages.extend(history)
+    messages.append({"role": "user", "content": task})
+
     payload = {
         "model": model_name,
-        "messages": [
-            {
-                "role": "system",
-                "content": (
-                    "You are an expert autonomous software engineer and data architect agent. "
-                    "When building complex software systems, output the complete, functional python "
-                    "source code enclosed inside a clean ```python markdown block."
-                )
-            },
-            {
-                "role": "user",
-                "content": task
-            }
-        ],
-        "stream": False,
+        "messages": messages,
+        "stream": True,
         "options": {
             "temperature": 0.2
         }
     }
-    
-    with httpx2.Client(timeout=300.0) as client:
-        response = client.post(OLLAMA_URL, json=payload)
-        response.raise_for_status()
-        return response.json()["message"]["content"]
+
+    full_response = ""
+    # Increased timeout to 900 seconds (15 minutes)
+    with httpx2.Client(timeout=900.0) as client:
+        with client.stream("POST", OLLAMA_URL, json=payload) as response:
+            response.raise_for_status()
+            for line in response.iter_lines():
+                if line:
+                    chunk = json.loads(line.decode('utf-8'))
+                    if "message" in chunk:
+                        content = chunk["message"].get("content", "")
+                        print(content, end="", flush=True)
+                        full_response += content
+                    if chunk.get("done"):
+                        break
+    return full_response
 
 if __name__ == "__main__":
     print("🤖 Waking up Multi-Model Local Agent Engine...")
-    
+
     # Strictly bound to the exact names verified in your ollama inventory list
     models_inventory = {
         "1": "qwen3-coder:30b",
@@ -49,30 +64,38 @@ if __name__ == "__main__":
         "3": "freebuff-mimo:latest",
         "4": "llama3.2:latest"
     }
-    
+
     print("\n🗂️  Available Local Brain Options:")
     for key, name in models_inventory.items():
         print(f"  [{key}] {name}")
-        
+
     choice = input("\n👉 Select a model brain to run this step (1-4): ").strip()
     selected_model = models_inventory.get(choice, "qwen3-coder:30b")
-    
+
+    # Initialize session history
+    session_history = []
+
     print(f"\n🧠 Active Engine locked to: '{selected_model}'")
     print(f"📁 Local Files Detected: {scan_workspace()}")
     print("--- Enter your application requirements (Type 'exit' to quit) ---")
-    
+
     while True:
         user_task = input("\n👉 User: ")
         if user_task.lower() in ['exit', 'quit']:
             break
         if not user_task.strip():
             continue
-            
+
         print(f"\n🧠 Thinking (Processing Locally via {selected_model})...")
         try:
-            agent_output = prompt_local_model(selected_model, user_task)
-            print(f"\n🤖 Agent Output:\n{agent_output}")
-            
+            # The prompt_local_model now handles the printing via streaming
+            agent_output = prompt_local_model(selected_model, user_task, history=session_history)
+            print() # Add a newline after the streamed response ends
+
+            # Update session history with the user prompt and agent response
+            session_history.append({"role": "user", "content": user_task})
+            session_history.append({"role": "assistant", "content": agent_output})
+
             if "```python" in agent_output:
                 print("\n💡 I detected python code output! Would you like to save this file? (yes/no)")
                 save_choice = input("👉 Choice: ")
