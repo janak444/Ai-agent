@@ -133,6 +133,27 @@ def _detect_ram_gb():
     return None
 
 
+def _project_prefs_path(root):
+    h = abs(hash(os.path.abspath(root))) % (10 ** 8)
+    return os.path.expanduser(f"~/.mimo_ide_proj_{h}.json")
+
+
+def _load_project_prefs(root):
+    try:
+        with open(_project_prefs_path(root), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        return {}
+
+
+def _save_project_prefs(root, prefs):
+    try:
+        with open(_project_prefs_path(root), "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except OSError:
+        pass
+
+
 class Tooltip:
     """Lightweight hover tooltip for any CTk widget."""
 
@@ -238,6 +259,7 @@ class MimoIDE(ctk.CTk):
         self.active_index = 0
         self.settings = _load_settings()
         self.ram_gb = _detect_ram_gb()
+        ctk.set_appearance_mode(self.settings.get("theme", "dark").capitalize())
         self.models_inventory = {
             "qwen3-coder:30b": "Qwen 3 Coder (30B)",
             "deepseek-r1:latest": "DeepSeek R1",
@@ -293,6 +315,12 @@ class MimoIDE(ctk.CTk):
                                         command=self._open_model_manager)
         self.models_btn.pack(side="right", padx=(0, 4), pady=7)
         Tooltip(self.models_btn, "Model manager  (pull, delete, sizes)")
+        self.theme_btn = ctk.CTkButton(self.tab_bar, text="◐", width=36, height=30,
+                                       fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                       font=ctk.CTkFont(size=15),
+                                       command=self.toggle_theme)
+        self.theme_btn.pack(side="right", padx=(0, 4), pady=7)
+        Tooltip(self.theme_btn, "Toggle dark / light theme")
 
         # --- sidebar ---
         self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=PANEL)
@@ -336,6 +364,12 @@ class MimoIDE(ctk.CTk):
                                           command=self.new_chat)
         self.new_chat_btn.grid(row=0, column=1, padx=(6, 0))
         Tooltip(self.new_chat_btn, "New chat  (⌘N)")
+        self.sess_ops_btn = ctk.CTkButton(row4, text="⋯", width=34, height=34,
+                                          fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                          font=ctk.CTkFont(size=14, weight="bold"),
+                                          command=self._open_session_ops)
+        self.sess_ops_btn.grid(row=0, column=2, padx=(4, 0))
+        Tooltip(self.sess_ops_btn, "Session options  (rename / delete / export)")
 
         tasks_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
         tasks_hdr.grid(row=5, column=0, padx=18, pady=(12, 0), sticky="ew")
@@ -401,6 +435,11 @@ class MimoIDE(ctk.CTk):
                                         fg_color=GOLD, corner_radius=10, padx=10, pady=2,
                                         font=ctk.CTkFont(size=10, weight="bold"))
         self.model_badge.grid(row=0, column=1, padx=(8, 0))
+        self.tools_badge = ctk.CTkLabel(chat_hdr, text="", text_color=MUTED,
+                                        corner_radius=10, padx=8, pady=2,
+                                        font=ctk.CTkFont(size=9, weight="bold"))
+        self.tools_badge.grid(row=0, column=2, padx=(4, 0))
+        self._update_tools_badge()
 
         self.chat_display = ctk.CTkTextbox(self.chat_tab, fg_color="#0E0E0E", text_color=TEXT,
                                            wrap="word", font=ctk.CTkFont(size=13))
@@ -451,6 +490,44 @@ class MimoIDE(ctk.CTk):
         self.editor_box.bind("<Button-5>", self._sync_gutter_scroll, add="+")
         self.editor_box._textbox.configure(tabs=())
         self._setup_editor_tags()
+
+        # find/replace bar (hidden until ⌘F)
+        self.find_bar = ctk.CTkFrame(self.editor_tab, fg_color=CARD, corner_radius=8)
+        self.find_bar.grid(row=2, column=0, sticky="ew", pady=(4, 0))
+        self.find_bar.grid_columnconfigure(1, weight=1)
+        self.find_bar.grid_remove()
+        ctk.CTkLabel(self.find_bar, text="Find", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, padx=(10, 4), pady=6)
+        self.find_entry = ctk.CTkEntry(self.find_bar, height=28, fg_color=BG, border_color=ACTIVE,
+                                       text_color=TEXT)
+        self.find_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.find_entry.bind("<Return>", lambda _e: self.find_next())
+        ctk.CTkLabel(self.find_bar, text="Replace", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=1, column=0, padx=(10, 4), pady=6)
+        self.replace_entry = ctk.CTkEntry(self.find_bar, height=28, fg_color=BG, border_color=ACTIVE,
+                                          text_color=TEXT)
+        self.replace_entry.grid(row=1, column=1, sticky="ew", pady=6)
+        find_btns = ctk.CTkFrame(self.find_bar, fg_color="transparent")
+        find_btns.grid(row=0, column=2, rowspan=2, padx=(8, 10), pady=6)
+        ctk.CTkButton(find_btns, text="Next", width=60, height=26, fg_color=ACTIVE,
+                      text_color=TEXT, command=self.find_next).pack(pady=2)
+        ctk.CTkButton(find_btns, text="Replace", width=60, height=26, fg_color=ACTIVE,
+                      text_color=TEXT, command=self.find_replace).pack(pady=2)
+        ctk.CTkButton(find_btns, text="All", width=60, height=26, fg_color=ACTIVE,
+                      text_color=TEXT, command=self.find_replace_all).pack(pady=2)
+        ctk.CTkButton(find_btns, text="✕", width=60, height=26, fg_color="#4A1A1A",
+                      text_color=RED, command=self._hide_find_bar).pack(pady=2)
+
+        # goto-line bar (hidden until ⌘G)
+        self.goto_bar = ctk.CTkFrame(self.editor_tab, fg_color=CARD, corner_radius=8)
+        self.goto_bar.grid(row=3, column=0, sticky="ew", pady=(4, 0))
+        ctk.CTkLabel(self.goto_bar, text="Go to line", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(side="left", padx=(10, 6))
+        self.goto_entry = ctk.CTkEntry(self.goto_bar, width=80, height=28, fg_color=BG,
+                                       border_color=ACTIVE, text_color=TEXT)
+        self.goto_entry.pack(side="left", pady=6)
+        self.goto_entry.bind("<Return>", lambda _e: self.goto_line())
+        self.goto_bar.grid_remove()
 
         # Terminal tab
         self.terminal_tab.grid_columnconfigure(0, weight=1)
@@ -672,6 +749,9 @@ class MimoIDE(ctk.CTk):
         self.bind("<Command-t>", lambda _e: (self._add_project_dialog(), "break")[1])
         self.bind("<Command-s>", lambda _e: (self.save_editor(), "break")[1])
         self.bind("<Escape>", lambda _e: (self.stop_generation(), "break")[1])
+        self.bind("<Command-f>", lambda _e: (self.toggle_find_bar(), "break")[1])
+        self.bind("<Command-g>", lambda _e: (self.toggle_goto_bar(), "break")[1])
+        self.bind("<Command-p>", lambda _e: (self._open_fuzzy_finder(), "break")[1])
         for i, name in enumerate(MAIN_TAB_NAMES):
             self.bind(f"<Command-{i + 1}>",
                       lambda _e, n=name: (self.main_tabs.set(n), "break")[1])
@@ -708,6 +788,11 @@ class MimoIDE(ctk.CTk):
                 self.select_tab(i)
                 return
         tab = ProjectTab(path)
+        prefs = _load_project_prefs(path)
+        if prefs.get("model"):
+            tab.model = prefs["model"]
+        if prefs.get("session_id"):
+            tab.session_id = prefs["session_id"]
         self.tabs.append(tab)
         self.active_index = len(self.tabs) - 1
         self._activate_tab()
@@ -768,7 +853,67 @@ class MimoIDE(ctk.CTk):
         if path:
             self.add_project_tab(path)
 
+    # ------------------------------------------------------ fuzzy finder --
+    def _open_fuzzy_finder(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Go to file")
+        win.geometry("620x480")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        entry = ctk.CTkEntry(win, height=36, fg_color=CARD, border_color=GOLD,
+                             text_color=TEXT, placeholder_text="Type to search files…",
+                             font=ctk.CTkFont(size=14))
+        entry.pack(fill="x", padx=14, pady=(14, 6))
+        box = ctk.CTkScrollableFrame(win, fg_color=PANEL)
+        box.pack(fill="both", expand=True, padx=14, pady=(0, 14))
+        files = tab.files or []
+
+        def render(query=""):
+            for w in box.winfo_children():
+                w.destroy()
+            q = query.lower().strip()
+            if q:
+                scored = []
+                for f in files:
+                    fl = f.lower()
+                    if q in fl:
+                        scored.append((fl.index(q), len(f), f))
+                scored.sort()
+                matches = [f for _, _, f in scored[:40]]
+            else:
+                matches = files[:40]
+            if not matches:
+                ctk.CTkLabel(box, text="No matches", text_color="#666",
+                             font=ctk.CTkFont(size=12)).pack(pady=20)
+                return
+            for f in matches:
+                btn = ctk.CTkButton(box, text=f, anchor="w", height=30, fg_color="transparent",
+                                    hover_color=ACTIVE, text_color=TEXT,
+                                    font=ctk.CTkFont(family="Menlo", size=12),
+                                    command=lambda path=f: (win.destroy(), self.open_file(path)))
+                btn.pack(fill="x", padx=4, pady=1)
+
+        def on_key(_e=None):
+            render(entry.get())
+
+        entry.bind("<KeyRelease>", on_key)
+        render()
+        entry.focus_set()
+
     # ---------------------------------------------------------- settings --
+    def toggle_theme(self):
+        mode = ctk.get_appearance_mode()
+        new = "Light" if mode == "Dark" else "Dark"
+        ctk.set_appearance_mode(new)
+        self.settings["theme"] = new.lower()
+        _save_settings(self.settings)
+        self.append_chat(f"🎨 Theme: {new}", tag="system")
+
     def _open_settings(self):
         win = ctk.CTkToplevel(self)
         win.title("Settings")
@@ -1023,6 +1168,7 @@ class MimoIDE(ctk.CTk):
         self.title(f"Mimo Agentic IDE — {tab.name}")
         self.chat_ctx_label.configure(text=f"{tab.name}  ·  {tab.root}")
         self.model_badge.configure(text=tab.model)
+        self._update_tools_badge()
         display = self.models_inventory.get(tab.model, tab.model)
         if display in list(self.model_dropdown.cget("values")):
             self.model_dropdown.set(display)
@@ -1334,8 +1480,24 @@ class MimoIDE(ctk.CTk):
             if val == display:
                 tab.model = key
                 self.model_badge.configure(text=key)
+                self._update_tools_badge()
+                _save_project_prefs(tab.root, {"model": key, "session_id": tab.session_id})
                 self.append_chat(f"🧠 Brain for {tab.name}: {display}", tag="system")
                 return
+
+    _TOOL_CAPABLE = ("qwen", "llama3.1", "llama3.2", "mistral", "gemma2", "command-r",
+                     "firefunction", "nexusrouter", "glm", "kimi", "minicpm", "phi3", "phi4")
+
+    def _update_tools_badge(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        name = tab.model.lower()
+        capable = any(k in name for k in self._TOOL_CAPABLE)
+        if capable:
+            self.tools_badge.configure(text="⚙ tools", fg_color="#1B3A1B", text_color=GREEN)
+        else:
+            self.tools_badge.configure(text="⚠ no tools", fg_color="#3A1B1B", text_color=RED)
 
     def refresh_sessions(self, tab, keep_selection=False):
         labels = ["(new chat)"]
@@ -1372,10 +1534,12 @@ class MimoIDE(ctk.CTk):
             return
         if label == "(new chat)":
             tab.session_id = None
+            _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
             return
         sid = tab.session_labels.get(label)
         if sid:
             tab.session_id = sid
+            _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
             self.append_chat(f"↩ Next message resumes session {sid}", tag="system")
             self._load_session_tasks(tab, sid)
 
@@ -1388,6 +1552,83 @@ class MimoIDE(ctk.CTk):
             tab.tasks_data = []
         if tab is self.active_tab():
             self.after(0, self.refresh_tasks_panel)
+
+    # ------------------------------------------------------ session ops --
+    def _open_session_ops(self):
+        tab = self.active_tab()
+        if not tab or not tab.session_id:
+            self.append_chat("Select a session first (or start a chat).", tag="system")
+            return
+        sid = tab.session_id
+        win = ctk.CTkToplevel(self)
+        win.title(f"Session {sid[-8:]}")
+        win.geometry("420x260")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        ctk.CTkLabel(win, text=f"Session {sid}", text_color=GOLD,
+                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=18, pady=(16, 12))
+
+        row = ctk.CTkFrame(win, fg_color="transparent")
+        row.pack(fill="x", padx=14, pady=4)
+        ctk.CTkLabel(row, text="Rename to", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).pack(anchor="w")
+        name_entry = ctk.CTkEntry(row, height=30, fg_color=CARD, border_color=ACTIVE,
+                                  text_color=TEXT)
+        name_entry.pack(fill="x", pady=(2, 0))
+
+        def do_rename():
+            new = name_entry.get().strip()
+            if not new:
+                return
+            path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+            try:
+                with open(path, encoding="utf-8") as f:
+                    data = json.load(f)
+                data["name"] = new
+                with open(path, "w", encoding="utf-8") as f:
+                    json.dump(data, f, indent=2)
+                win.destroy()
+                self.refresh_sessions(tab, keep_selection=True)
+                self.append_chat(f"✎ Session renamed to '{new}'", tag="success")
+            except (OSError, json.JSONDecodeError) as e:
+                self.append_chat(f"❌ Rename failed: {e}", tag="error")
+
+        ctk.CTkButton(row, text="Rename", height=30, fg_color=GOLD, text_color="#000",
+                      hover_color="#FFB300", command=do_rename).pack(anchor="w", pady=(6, 0))
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(16, 0))
+
+        def do_export():
+            path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+            dest = filedialog.asksaveasfilename(defaultextension=".json",
+                                                initialfile=f"session_{sid[-8:]}.json")
+            if dest:
+                try:
+                    shutil.copy2(path, dest)
+                    self.append_chat(f"⬇ Exported session to {dest}", tag="success")
+                except OSError as e:
+                    self.append_chat(f"❌ Export failed: {e}", tag="error")
+            win.destroy()
+
+        def do_delete():
+            path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+            try:
+                os.remove(path)
+                tab.session_id = None
+                _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
+                win.destroy()
+                self.refresh_sessions(tab)
+                self.append_chat(f"🗑 Deleted session {sid[-8:]}", tag="success")
+            except OSError as e:
+                self.append_chat(f"❌ Delete failed: {e}", tag="error")
+
+        ctk.CTkButton(btns, text="⬇ Export", height=32, fg_color=CARD, hover_color=ACTIVE,
+                      text_color=TEXT, command=do_export).pack(side="left", padx=(0, 6))
+        ctk.CTkButton(btns, text="🗑 Delete", height=32, fg_color="#4A1A1A", hover_color=RED,
+                      text_color=RED, command=do_delete).pack(side="left")
 
     def refresh_tasks_panel(self):
         tab = self.active_tab()
@@ -1659,6 +1900,113 @@ class MimoIDE(ctk.CTk):
         tab.editor_dirty = False
         self._restore_editor(tab)
         self.append_chat(f"⟳ Reloaded {tab.editor_path} from disk", tag="system")
+
+    def _sync_editor_from_disk(self, tab):
+        """If the agent edited the open file, reload it (unless user has unsaved edits)."""
+        if not tab.editor_path:
+            return
+        path = os.path.join(tab.root, tab.editor_path)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                disk = f.read()
+        except OSError:
+            return
+        if tab.editor_dirty:
+            if tab is self.active_tab():
+                self.append_chat(f"⚠️ Agent changed {tab.editor_path} on disk — you have unsaved "
+                                 "edits. Use ⟳ Reload to take the agent's version, or 💾 Save to keep yours.",
+                                 tag="system")
+            return
+        if disk != tab.editor_text:
+            tab.editor_text = disk
+            if tab is self.active_tab():
+                self._restore_editor(tab)
+                self.append_chat(f"⟳ Editor synced — {tab.editor_path} was updated by the agent.",
+                                 tag="system")
+
+    # --------------------------------------------------- editor find/goto --
+    def toggle_find_bar(self):
+        self.main_tabs.set("Editor")
+        if self.find_bar.winfo_ismapped():
+            self._hide_find_bar()
+        else:
+            self.find_bar.grid()
+            self.find_entry.focus_set()
+            self.find_entry.select_range(0, "end")
+
+    def _hide_find_bar(self):
+        self.find_bar.grid_remove()
+        tb = self.editor_box._textbox
+        tb.tag_remove("findhl", "1.0", "end")
+        self.editor_box.focus_set()
+
+    def find_next(self):
+        needle = self.find_entry.get()
+        if not needle:
+            return
+        tb = self.editor_box._textbox
+        tb.tag_remove("findhl", "1.0", "end")
+        tb.tag_configure("findhl", background="#4A3A00", foreground="#FFE082")
+        start = tb.index("insert")
+        pos = tb.search(needle, start, stopindex="end", nocase=True)
+        if not pos:
+            pos = tb.search(needle, "1.0", stopindex="end", nocase=True)
+        if pos:
+            end = f"{pos}+{len(needle)}c"
+            tb.tag_add("findhl", pos, end)
+            tb.mark_set("insert", end)
+            tb.see(pos)
+
+    def find_replace(self):
+        needle = self.find_entry.get()
+        repl = self.replace_entry.get()
+        if not needle:
+            return
+        tb = self.editor_box._textbox
+        sel = tb.tag_ranges("sel")
+        if sel:
+            selected = tb.get(sel[0], sel[1])
+            if selected.lower() == needle.lower():
+                tb.delete(sel[0], sel[1])
+                tb.insert(sel[0], repl)
+        self.find_next()
+
+    def find_replace_all(self):
+        needle = self.find_entry.get()
+        repl = self.replace_entry.get()
+        if not needle:
+            return
+        tb = self.editor_box._textbox
+        content = tb.get("1.0", "end-1c")
+        count = len(re.findall(re.escape(needle), content, re.IGNORECASE))
+        if count:
+            new = re.sub(re.escape(needle), repl, content, flags=re.IGNORECASE)
+            tb.delete("1.0", "end")
+            tb.insert("1.0", new)
+            self._on_editor_changed()
+            self.append_chat(f"Replaced {count} occurrence(s).", tag="system")
+
+    def toggle_goto_bar(self):
+        self.main_tabs.set("Editor")
+        if self.goto_bar.winfo_ismapped():
+            self.goto_bar.grid_remove()
+        else:
+            self.goto_bar.grid()
+            self.goto_entry.focus_set()
+            self.goto_entry.select_range(0, "end")
+
+    def goto_line(self):
+        try:
+            n = int(self.goto_entry.get().strip())
+        except ValueError:
+            return
+        tb = self.editor_box._textbox
+        total = int(tb.index("end-1c").split(".")[0])
+        n = max(1, min(n, total))
+        tb.mark_set("insert", f"{n}.0")
+        tb.see(f"{n}.0")
+        self.goto_bar.grid_remove()
+        self.editor_box.focus_set()
 
     def _restore_editor(self, tab):
         self.editor_box.delete("1.0", "end")
@@ -2383,6 +2731,7 @@ class MimoIDE(ctk.CTk):
             self.after(0, lambda: self._render_files(tab))
             self.after(0, lambda: self.refresh_changes_panel(silent=True))
             self.after(0, lambda: self.refresh_git_panel(silent=True))
+            self.after(0, lambda: self._sync_editor_from_disk(tab))
             if tab.pending_tasks and not tab.stop_requested:
                 nxt = tab.pending_tasks.pop(0)
                 self.append_chat(f"▶ Running queued prompt ({len(tab.pending_tasks)} left)…",
