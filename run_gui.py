@@ -21,6 +21,16 @@ PROJECT_SKIP_DIRS = {'.git', '.vscode', '__pycache__', 'node_modules', 'venv', '
 MAX_TRANSCRIPT = 600
 RECENT_PROJECTS_FILE = os.path.expanduser("~/.mimo_ide_projects.json")
 GEOM_FILE = os.path.expanduser("~/.mimo_ide_geometry.json")
+SETTINGS_FILE = os.path.expanduser("~/.mimo_ide_settings.json")
+
+DEFAULT_SETTINGS = {
+    "ollama_host": "http://127.0.0.1:11434",
+    "num_ctx": 16384,
+    "temperature": 0.2,
+    "keep_alive": "30m",
+    "auto_approve": True,
+    "num_predict": -1,
+}
 
 BG = "#121212"
 PANEL = "#1A1A1A"
@@ -87,6 +97,40 @@ def _save_geometry(app):
                        "x": app.winfo_x(), "y": app.winfo_y()}, f)
     except OSError:
         pass
+
+
+def _load_settings():
+    try:
+        with open(SETTINGS_FILE, encoding="utf-8") as f:
+            saved = json.load(f)
+        merged = dict(DEFAULT_SETTINGS)
+        merged.update({k: v for k, v in saved.items() if k in DEFAULT_SETTINGS})
+        return merged
+    except (OSError, json.JSONDecodeError):
+        return dict(DEFAULT_SETTINGS)
+
+
+def _save_settings(s):
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(s, f, indent=2)
+    except OSError:
+        pass
+
+
+def _detect_ram_gb():
+    try:
+        r = subprocess.run(["sysctl", "-n", "hw.memsize"], capture_output=True, text=True, timeout=3)
+        return int(r.stdout.strip()) / (1024 ** 3)
+    except Exception:
+        try:
+            r = subprocess.run(["free", "-b"], capture_output=True, text=True, timeout=3)
+            for line in r.stdout.splitlines():
+                if line.lower().startswith("mem:"):
+                    return int(line.split()[1]) / (1024 ** 3)
+        except Exception:
+            pass
+    return None
 
 
 class Tooltip:
@@ -192,12 +236,15 @@ class MimoIDE(ctk.CTk):
 
         self.tabs = []
         self.active_index = 0
+        self.settings = _load_settings()
+        self.ram_gb = _detect_ram_gb()
         self.models_inventory = {
             "qwen3-coder:30b": "Qwen 3 Coder (30B)",
             "deepseek-r1:latest": "DeepSeek R1",
             "freebuff-mimo:latest": "FreeBuff Mimo",
             "llama3.2:latest": "Llama 3.2",
         }
+        self.models_meta = {}
 
         self._build_ui()
         self._bind_shortcuts()
@@ -234,6 +281,18 @@ class MimoIDE(ctk.CTk):
                                          command=self._add_project_dialog)
         self.add_tab_btn.pack(side="right", padx=(4, 14), pady=7)
         Tooltip(self.add_tab_btn, "Open a project (recent list)")
+        self.settings_btn = ctk.CTkButton(self.tab_bar, text="⚙", width=36, height=30,
+                                          fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                          font=ctk.CTkFont(size=15),
+                                          command=self._open_settings)
+        self.settings_btn.pack(side="right", padx=(0, 4), pady=7)
+        Tooltip(self.settings_btn, "Settings  (host, context, temperature, models)")
+        self.models_btn = ctk.CTkButton(self.tab_bar, text="⬇", width=36, height=30,
+                                        fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                        font=ctk.CTkFont(size=15),
+                                        command=self._open_model_manager)
+        self.models_btn.pack(side="right", padx=(0, 4), pady=7)
+        Tooltip(self.models_btn, "Model manager  (pull, delete, sizes)")
 
         # --- sidebar ---
         self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=PANEL)
@@ -363,16 +422,35 @@ class MimoIDE(ctk.CTk):
                                               font=ctk.CTkFont(family="Menlo", size=12),
                                               anchor="w")
         self.editor_path_label.grid(row=0, column=0, sticky="w")
+        self.editor_reload_btn = ctk.CTkButton(ebar, text="⟳ Reload", width=80, height=28,
+                                               fg_color=CARD, text_color=TEXT,
+                                               hover_color=ACTIVE, command=self.reload_editor)
+        self.editor_reload_btn.grid(row=0, column=1, padx=(8, 0))
+        Tooltip(self.editor_reload_btn, "Reload file from disk (discard local edits)")
         self.editor_save_btn = ctk.CTkButton(ebar, text="💾 Save", width=90, height=28,
                                              fg_color=CARD, text_color=TEXT,
                                              hover_color=ACTIVE, command=self.save_editor)
-        self.editor_save_btn.grid(row=0, column=1, padx=(8, 0))
+        self.editor_save_btn.grid(row=0, column=2, padx=(8, 0))
         Tooltip(self.editor_save_btn, "Save file  (⌘S)")
-        self.editor_box = ctk.CTkTextbox(self.editor_tab, fg_color="#0E0E0E", text_color="#D4D4D4",
+        editor_wrap = ctk.CTkFrame(self.editor_tab, fg_color="#0E0E0E", corner_radius=0)
+        editor_wrap.grid(row=1, column=0, sticky="nsew")
+        editor_wrap.grid_columnconfigure(1, weight=1)
+        editor_wrap.grid_rowconfigure(0, weight=1)
+        self.editor_gutter = ctk.CTkTextbox(editor_wrap, width=52, fg_color="#0A0A0A",
+                                            text_color="#555", wrap="none",
+                                            font=ctk.CTkFont(family="Menlo", size=13),
+                                            state="disabled", activate_scrollbars=False)
+        self.editor_gutter.grid(row=0, column=0, sticky="nsw")
+        self.editor_box = ctk.CTkTextbox(editor_wrap, fg_color="#0E0E0E", text_color="#D4D4D4",
                                          font=ctk.CTkFont(family="Menlo", size=13),
                                          wrap="none")
-        self.editor_box.grid(row=1, column=0, sticky="nsew")
-        self.editor_box.bind("<KeyRelease>", self._mark_editor_dirty, add="+")
+        self.editor_box.grid(row=0, column=1, sticky="nsew")
+        self.editor_box.bind("<KeyRelease>", self._on_editor_changed, add="+")
+        self.editor_box.bind("<MouseWheel>", self._sync_gutter_scroll, add="+")
+        self.editor_box.bind("<Button-4>", self._sync_gutter_scroll, add="+")
+        self.editor_box.bind("<Button-5>", self._sync_gutter_scroll, add="+")
+        self.editor_box._textbox.configure(tabs=())
+        self._setup_editor_tags()
 
         # Terminal tab
         self.terminal_tab.grid_columnconfigure(0, weight=1)
@@ -382,10 +460,15 @@ class MimoIDE(ctk.CTk):
         tbar.grid_columnconfigure(0, weight=1)
         ctk.CTkLabel(tbar, text="Raw agent stream", text_color=MUTED,
                      font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        self.run_tests_btn = ctk.CTkButton(tbar, text="🧪 Run tests", width=100, height=26,
+                                           fg_color=CARD, hover_color=ACTIVE,
+                                           text_color=TEXT, command=self.run_tests)
+        self.run_tests_btn.grid(row=0, column=1, padx=(8, 0))
+        Tooltip(self.run_tests_btn, "Auto-detect and run the project's test suite")
         self.terminal_clear_btn = ctk.CTkButton(tbar, text="Clear", width=70, height=26,
                                                 fg_color=CARD, hover_color=ACTIVE,
                                                 text_color=TEXT, command=self._clear_terminal)
-        self.terminal_clear_btn.grid(row=0, column=1, padx=(8, 0))
+        self.terminal_clear_btn.grid(row=0, column=2, padx=(8, 0))
         self.terminal_box = ctk.CTkTextbox(self.terminal_tab, fg_color="#0A0A0A",
                                            text_color="#B8B8B8",
                                            font=ctk.CTkFont(family="Menlo", size=12),
@@ -513,6 +596,7 @@ class MimoIDE(ctk.CTk):
         self.user_input.bind("<FocusIn>", self._on_input_focus_in, add="+")
         self.user_input.bind("<FocusOut>", self._on_input_focus_out, add="+")
         self.user_input._textbox.bind("<Button-1>", self._on_input_click, add="+")
+        self.user_input.bind("<Command-v>", self._on_input_paste, add="+")
         input_wrap.bind("<Button-1>", lambda _e: self.user_input.focus_set())
         self.input_hint = ctk.CTkLabel(input_wrap,
                                        text="Describe a task, ask a question, or attach an image…   "
@@ -527,7 +611,12 @@ class MimoIDE(ctk.CTk):
                                         fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
                                         command=self.upload_image)
         self.img_button.grid(row=2, column=1, padx=(0, 10))
-        Tooltip(self.img_button, "Attach an image for the vision model")
+        Tooltip(self.img_button, "Attach an image for the vision model  (⌘V paste)")
+        self.undo_button = ctk.CTkButton(self.input_frame, text="↩", width=40, height=48,
+                                         fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                         command=self.gui_undo)
+        self.undo_button.grid(row=2, column=1, padx=(0, 64))
+        Tooltip(self.undo_button, "Undo last agent file change")
         self.send_button = ctk.CTkButton(self.input_frame, text="▶  Run", width=120, height=48,
                                          fg_color=GOLD, text_color="#000", hover_color="#FFB300",
                                          font=ctk.CTkFont(weight="bold"), command=self.send_request)
@@ -554,7 +643,12 @@ class MimoIDE(ctk.CTk):
         ctk.CTkLabel(inner, text="◈ Mimo Agentic IDE", text_color=GOLD,
                      font=ctk.CTkFont(size=28, weight="bold")).pack(pady=(0, 6))
         ctk.CTkLabel(inner, text="Your local AI engineer — plans, codes, verifies, and reports.",
-                     text_color=MUTED, font=ctk.CTkFont(size=14)).pack(pady=(0, 22))
+                     text_color=MUTED, font=ctk.CTkFont(size=14)).pack(pady=(0, 8))
+        if self.ram_gb:
+            tip = self._ram_model_tip(self.ram_gb)
+            ctk.CTkLabel(inner, text=f"RAM {self.ram_gb:.0f} GB · {tip}",
+                         text_color=BLUE, font=ctk.CTkFont(size=11), wraplength=480,
+                         justify="center").pack(pady=(0, 14))
         ctk.CTkLabel(inner, text="Try one of these:", text_color="#666",
                      font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 8))
         for label, prompt in STARTERS:
@@ -563,7 +657,7 @@ class MimoIDE(ctk.CTk):
                                 font=ctk.CTkFont(size=13),
                                 command=lambda p=prompt: self._use_starter(p))
             btn.pack(fill="x", pady=3)
-        ctk.CTkLabel(inner, text="Attach an image with 🖼 to ask about screenshots & designs.",
+        ctk.CTkLabel(inner, text="Attach an image with 🖼 or ⌘V paste to ask about screenshots & designs.",
                      text_color="#555", font=ctk.CTkFont(size=11)).pack(pady=(16, 0))
 
     def _use_starter(self, prompt):
@@ -673,6 +767,228 @@ class MimoIDE(ctk.CTk):
         path = filedialog.askdirectory()
         if path:
             self.add_project_tab(path)
+
+    # ---------------------------------------------------------- settings --
+    def _open_settings(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Settings")
+        win.geometry("520x520")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        ctk.CTkLabel(win, text="⚙ Settings", text_color=GOLD,
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=18, pady=(16, 12))
+        form = ctk.CTkScrollableFrame(win, fg_color=PANEL)
+        form.pack(fill="both", expand=True, padx=14, pady=4)
+
+        s = self.settings
+        entries = {}
+
+        def add_row(label, key, tip=""):
+            row = ctk.CTkFrame(form, fg_color="transparent")
+            row.pack(fill="x", padx=8, pady=6)
+            ctk.CTkLabel(row, text=label, text_color=TEXT,
+                         font=ctk.CTkFont(size=12), anchor="w").pack(anchor="w")
+            if tip:
+                ctk.CTkLabel(row, text=tip, text_color="#666",
+                             font=ctk.CTkFont(size=10), anchor="w").pack(anchor="w")
+            val = s.get(key, DEFAULT_SETTINGS[key])
+            if isinstance(val, bool):
+                w = ctk.CTkSwitch(row, text="enabled" if val else "disabled",
+                                  variable=ctk.BooleanVar(value=val),
+                                  fg_color=ACTIVE, progress_color=GOLD, text_color=TEXT)
+                w.pack(anchor="w", pady=(2, 0))
+                entries[key] = ("switch", w)
+            else:
+                e = ctk.CTkEntry(row, height=30, fg_color=CARD, border_color=ACTIVE,
+                                 text_color=TEXT)
+                e.insert(0, str(val))
+                e.pack(fill="x", pady=(2, 0))
+                entries[key] = ("entry", e)
+
+        add_row("Ollama host", "ollama_host", "Where your Ollama server runs")
+        add_row("Context window (num_ctx)", "num_ctx", "Larger = more memory, better long files")
+        add_row("Temperature", "temperature", "Lower = more deterministic code")
+        add_row("Keep-alive", "keep_alive", "How long the model stays loaded (e.g. 30m)")
+        add_row("Max output tokens", "num_predict", "-1 = unlimited")
+        add_row("Auto-approve actions", "auto_approve", "Skip per-command confirmation")
+
+        if self.ram_gb:
+            ctk.CTkLabel(form, text=f"Detected RAM: {self.ram_gb:.0f} GB",
+                         text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(8, 0))
+            tip = self._ram_model_tip(self.ram_gb)
+            if tip:
+                ctk.CTkLabel(form, text=tip, text_color=BLUE, font=ctk.CTkFont(size=11),
+                             wraplength=440, justify="left").pack(anchor="w", padx=8, pady=(2, 0))
+
+        def save():
+            for key, (kind, w) in entries.items():
+                if kind == "switch":
+                    s[key] = bool(w.get())
+                else:
+                    raw = w.get().strip()
+                    old = s.get(key, DEFAULT_SETTINGS[key])
+                    if isinstance(old, bool):
+                        s[key] = raw.lower() in ("1", "true", "yes", "on")
+                    elif isinstance(old, int):
+                        try:
+                            s[key] = int(raw)
+                        except ValueError:
+                            pass
+                    elif isinstance(old, float):
+                        try:
+                            s[key] = float(raw)
+                        except ValueError:
+                            pass
+                    else:
+                        s[key] = raw
+            _save_settings(s)
+            win.destroy()
+            self.append_chat("⚙ Settings saved.", tag="success")
+
+        ctk.CTkButton(win, text="Save", height=36, fg_color=GOLD, text_color="#000",
+                      hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
+                      command=save).pack(fill="x", padx=14, pady=(10, 16))
+
+    def _ram_model_tip(self, gb):
+        if gb >= 64:
+            return "Plenty of RAM — you can run 30B+ coder models comfortably."
+        if gb >= 32:
+            return "Good — 14B–30B models work well. Prefer quantized (Q4) versions."
+        if gb >= 16:
+            return "Try 7B–14B models (e.g. qwen2.5-coder:7b, llama3.1:8b)."
+        if gb >= 8:
+            return "Use small models (3B–8B). Close other apps to free memory."
+        return "Very limited RAM — expect slow responses with any model."
+
+    # ------------------------------------------------------ model manager --
+    def _open_model_manager(self):
+        win = ctk.CTkToplevel(self)
+        win.title("Model manager")
+        win.geometry("640x560")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        ctk.CTkLabel(win, text="⬇ Model manager", text_color=GOLD,
+                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=18, pady=(16, 6))
+        if self.ram_gb:
+            ctk.CTkLabel(win, text=f"Your RAM: {self.ram_gb:.0f} GB · {self._ram_model_tip(self.ram_gb)}",
+                         text_color=BLUE, font=ctk.CTkFont(size=11), wraplength=600,
+                         justify="left").pack(anchor="w", padx=18, pady=(0, 8))
+
+        pull_row = ctk.CTkFrame(win, fg_color="transparent")
+        pull_row.pack(fill="x", padx=14, pady=4)
+        pull_entry = ctk.CTkEntry(pull_row, height=32, fg_color=CARD, border_color=ACTIVE,
+                                  text_color=TEXT, placeholder_text="model name (e.g. qwen2.5-coder:7b)")
+        pull_entry.pack(side="left", fill="x", expand=True, padx=(0, 8))
+        pull_btn = ctk.CTkButton(pull_row, text="Pull", width=80, height=32,
+                                 fg_color=GOLD, text_color="#000", hover_color="#FFB300")
+        pull_btn.pack(side="left")
+
+        status = ctk.CTkLabel(win, text="Loading installed models…", text_color=MUTED,
+                              font=ctk.CTkFont(size=11))
+        status.pack(anchor="w", padx=18, pady=(6, 0))
+        box = ctk.CTkScrollableFrame(win, fg_color=PANEL)
+        box.pack(fill="both", expand=True, padx=14, pady=6)
+
+        def do_pull():
+            name = pull_entry.get().strip()
+            if not name:
+                return
+            pull_btn.configure(state="disabled", text="…")
+            status.configure(text=f"Pulling {name} — this can take a while…", text_color=GOLD)
+
+            def bg():
+                try:
+                    with httpx2.Client(timeout=10.0) as client:
+                        r = client.post(f"{self.settings['ollama_host']}/api/pull",
+                                        json={"name": name}, timeout=None)
+                        ok = r.status_code == 200
+                    self.after(0, lambda: (status.configure(
+                        text=f"Pulled {name}." if ok else f"Pull failed ({r.status_code}).",
+                        text_color=GREEN if ok else RED),
+                        pull_btn.configure(state="normal", text="Pull"),
+                        self.refresh_available_models()))
+                except Exception as e:
+                    self.after(0, lambda: (status.configure(text=f"Error: {e}", text_color=RED),
+                                           pull_btn.configure(state="normal", text="Pull")))
+            threading.Thread(target=bg, daemon=True).start()
+
+        pull_btn.configure(command=do_pull)
+
+        def load():
+            try:
+                with httpx2.Client(timeout=8.0) as client:
+                    r = client.get(f"{self.settings['ollama_host']}/api/tags")
+                    r.raise_for_status()
+                    models = r.json().get("models", [])
+            except Exception as e:
+                self.after(0, lambda: status.configure(text=f"Cannot reach Ollama: {e}", text_color=RED))
+                return
+            self.after(0, lambda: self._fill_model_manager(box, status, models))
+
+        threading.Thread(target=load, daemon=True).start()
+
+    def _fill_model_manager(self, box, status, models):
+        for w in box.winfo_children():
+            w.destroy()
+        status.configure(text=f"{len(models)} model(s) installed", text_color=MUTED)
+        self.models_meta = {m["name"]: m for m in models}
+        for m in models:
+            name = m.get("name", "?")
+            size_gb = (m.get("size") or 0) / (1024 ** 3)
+            modified = (m.get("modified_at") or "")[:10]
+            row = ctk.CTkFrame(box, fg_color=CARD, corner_radius=8)
+            row.pack(fill="x", padx=6, pady=4)
+            info = ctk.CTkFrame(row, fg_color="transparent")
+            info.pack(side="left", fill="x", expand=True, padx=10, pady=6)
+            ctk.CTkLabel(info, text=name, text_color=TEXT, font=ctk.CTkFont(size=12, weight="bold"),
+                         anchor="w").pack(anchor="w")
+            meta = f"{size_gb:.1f} GB"
+            if modified:
+                meta += f"  ·  updated {modified}"
+            if size_gb > (self.ram_gb or 999) * 0.8:
+                meta += "  ·  ⚠ large for your RAM"
+            ctk.CTkLabel(info, text=meta, text_color=MUTED, font=ctk.CTkFont(size=10),
+                         anchor="w").pack(anchor="w")
+            use_btn = ctk.CTkButton(row, text="Use", width=56, height=26,
+                                    fg_color=GOLD, text_color="#000", hover_color="#FFB300",
+                                    command=lambda n=name: self._use_model(n))
+            use_btn.pack(side="right", padx=(6, 8))
+            del_btn = ctk.CTkButton(row, text="✕", width=28, height=26,
+                                    fg_color="#4A1A1A", hover_color=RED, text_color=RED,
+                                    command=lambda n=name, s=status: self._delete_model(n, s))
+            del_btn.pack(side="right", padx=(0, 4))
+
+    def _use_model(self, name):
+        tab = self.active_tab()
+        if not tab:
+            return
+        tab.model = name
+        if name not in self.models_inventory:
+            self.models_inventory[name] = name
+            self.model_dropdown.configure(values=list(self.models_inventory.values()))
+        self.model_dropdown.set(self.models_inventory.get(name, name))
+        self.model_badge.configure(text=name)
+        self.append_chat(f"🧠 Brain for {tab.name}: {name}", tag="system")
+
+    def _delete_model(self, name, status):
+        status.configure(text=f"Deleting {name}…", text_color=GOLD)
+
+        def bg():
+            try:
+                with httpx2.Client(timeout=15.0) as client:
+                    r = client.delete(f"{self.settings['ollama_host']}/api/delete", json={"name": name})
+                    ok = r.status_code == 200
+                self.after(0, lambda: (status.configure(
+                    text=f"Deleted {name}." if ok else f"Delete failed ({r.status_code}).",
+                    text_color=GREEN if ok else RED),
+                    self.refresh_available_models()))
+            except Exception as e:
+                self.after(0, lambda: status.configure(text=f"Error: {e}", text_color=RED))
+        threading.Thread(target=bg, daemon=True).start()
 
     def close_tab(self, i):
         if not (0 <= i < len(self.tabs)):
@@ -981,13 +1297,19 @@ class MimoIDE(ctk.CTk):
     def refresh_available_models(self):
         def bg():
             try:
+                host = self.settings.get("ollama_host", "http://127.0.0.1:11434")
                 with httpx2.Client(timeout=5.0) as client:
-                    resp = client.get(OLLAMA_URL.replace("/api/chat", "/api/tags"))
+                    resp = client.get(f"{host}/api/tags")
                     resp.raise_for_status()
-                    installed = {m["name"].split(":")[0] for m in resp.json().get("models", [])}
+                    models = resp.json().get("models", [])
+                installed = {m["name"].split(":")[0] for m in models}
+                self.models_meta = {m["name"]: m for m in models}
                 keep = {k: v for k, v in self.models_inventory.items()
                         if k.split(":")[0] in installed}
-                if keep and keep != self.models_inventory:
+                for m in models:
+                    if m["name"] not in keep:
+                        keep[m["name"]] = m["name"]
+                if keep != self.models_inventory:
                     self.after(0, lambda: self._apply_model_inventory(keep))
             except Exception:
                 pass
@@ -1219,11 +1541,133 @@ class MimoIDE(ctk.CTk):
         except Exception:
             pass
 
+    # ---------------------------------------------------- editor syntax --
+    _PY_KW = ("def class return if elif else for while try except finally with as import "
+              "from pass break continue lambda yield global nonlocal assert del raise "
+              "async await not in is and or None True False self").split()
+    _JS_KW = ("function return if else for while try catch finally new var let const "
+              "class extends super this typeof instanceof import export default "
+              "async await null undefined true false").split()
+    _SH_KW = ("if then else elif fi for while do done case esac function echo exit "
+              "local export return set unset cd mkdir rm cp mv ls cat grep").split()
+
+    def _setup_editor_tags(self):
+        tb = self.editor_box._textbox
+        tb.tag_configure("kw", foreground="#C792EA")
+        tb.tag_configure("str", foreground="#C3E88D")
+        tb.tag_configure("com", foreground="#546E7A", font=ctk.CTkFont(family="Menlo", size=13, slant="italic"))
+        tb.tag_configure("num", foreground="#F78C6C")
+        tb.tag_configure("dec", foreground="#82AAFF")
+        tb.tag_configure("fn", foreground="#82AAFF")
+        tb.tag_configure("op", foreground="#89DDFF")
+
+    _SYNTAX_LANGS = {
+        ".py": "python", ".pyw": "python",
+        ".js": "js", ".mjs": "js", ".jsx": "js", ".ts": "js", ".tsx": "js",
+        ".json": "json", ".jsonc": "json",
+        ".html": "html", ".htm": "html", ".xml": "html", ".svg": "html",
+        ".css": "css", ".scss": "css", ".less": "css",
+        ".sh": "sh", ".bash": "sh", ".zsh": "sh",
+        ".c": "c", ".h": "c", ".cpp": "c", ".hpp": "c", ".cc": "c",
+        ".rs": "rs", ".go": "go", ".rb": "rb", ".sql": "sql", ".yaml": "yaml", ".yml": "yaml",
+    }
+
+    def _lang_for_path(self, path):
+        if not path:
+            return None
+        ext = os.path.splitext(path)[1].lower()
+        return self._SYNTAX_LANGS.get(ext)
+
+    def _highlight_editor(self, lang):
+        tb = self.editor_box._textbox
+        for tag in ("kw", "str", "com", "num", "dec", "fn", "op"):
+            tb.tag_remove(tag, "1.0", "end")
+        if not lang:
+            return
+        text = tb.get("1.0", "end-1c")
+        if lang == "python":
+            kw, dec = self._PY_KW, ("def", "class")
+        elif lang == "js":
+            kw, dec = self._JS_KW, ("function", "class")
+        elif lang == "sh":
+            kw, dec = self._SH_KW, ("function",)
+        else:
+            kw, dec = (), ()
+
+        patterns = []
+        if kw:
+            kw_re = r"\b(" + "|".join(re.escape(k) for k in kw) + r")\b"
+            patterns.append(("kw", re.compile(kw_re)))
+        patterns.append(("str", re.compile(r"\"\"\"[\s\S]*?\"\"\"|'''[\s\S]*?'''|\"(?:\\.|[^\"\\])*\"|'(?:\\.|[^'\\])*'")))
+        if lang in ("python", "js", "sh", "c", "rs", "go", "rb"):
+            patterns.append(("com", re.compile(r"#[^\n]*" if lang in ("python", "sh", "rb") else r"//[^\n]*" if lang in ("js", "c", "rs", "go") else r"#[^\n]*")))
+        if lang == "css":
+            patterns.append(("com", re.compile(r"/\*[\s\S]*?\*/")))
+            patterns.append(("dec", re.compile(r"[.#][A-Za-z_-][\w-]*")))
+            patterns.append(("kw", re.compile(r"@[a-z-]+")))
+        if lang == "html":
+            patterns.append(("com", re.compile(r"<!--[\s\S]*?-->")))
+            patterns.append(("dec", re.compile(r"</?[A-Za-z][\w-]*")))
+            patterns.append(("str", re.compile(r"\"[^\"]*\"|'[^']*'")))
+        if lang == "json":
+            patterns.append(("str", re.compile(r"\"(?:\\.|[^\"\\])*\"")))
+            patterns.append(("kw", re.compile(r"\b(?:true|false|null)\b")))
+        patterns.append(("num", re.compile(r"\b\d+\.?\d*\b")))
+        if lang in ("python", "js"):
+            patterns.append(("fn", re.compile(r"\b[A-Za-z_]\w*(?=\()")))
+        patterns.append(("op", re.compile(r"[=+\-*/%<>!&|^~?:]+")))
+
+        for tag, pat in patterns:
+            for m in pat.finditer(text):
+                s = f"1.0+{m.start()}c"
+                e = f"1.0+{m.end()}c"
+                tb.tag_add(tag, s, e)
+
+    def _update_gutter(self):
+        tb = self.editor_box._textbox
+        gtb = self.editor_gutter._textbox
+        total = int(tb.index("end-1c").split(".")[0])
+        self.editor_gutter.configure(state="normal")
+        self.editor_gutter.delete("1.0", "end")
+        self.editor_gutter.insert("1.0", "\n".join(str(i) for i in range(1, total + 1)))
+        self.editor_gutter.configure(state="disabled")
+
+    def _sync_gutter_scroll(self, _event=None):
+        try:
+            self.editor_gutter.yview_moveto(self.editor_box._textbox.yview()[0])
+        except Exception:
+            pass
+
+    def _on_editor_changed(self, _event=None):
+        self._update_gutter()
+        self._highlight_editor(self._lang_for_path(self.active_tab().editor_path if self.active_tab() else None))
+        self._sync_gutter_scroll()
+        self._mark_editor_dirty()
+
+    def reload_editor(self):
+        tab = self.active_tab()
+        if not tab or not tab.editor_path:
+            return
+        path = os.path.join(tab.root, tab.editor_path)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                content = f.read()
+        except OSError as e:
+            self.append_chat(f"❌ Reload failed: {e}", tag="error")
+            return
+        tab.editor_text = content
+        tab.editor_dirty = False
+        self._restore_editor(tab)
+        self.append_chat(f"⟳ Reloaded {tab.editor_path} from disk", tag="system")
+
     def _restore_editor(self, tab):
         self.editor_box.delete("1.0", "end")
         self.editor_box.insert("1.0", tab.editor_text or "")
         tab.editor_dirty = False
         self._update_editor_status(tab)
+        self._update_gutter()
+        self._highlight_editor(self._lang_for_path(tab.editor_path))
+        self._sync_gutter_scroll()
 
     def _update_editor_status(self, tab):
         if not tab.editor_path:
@@ -1317,6 +1761,49 @@ class MimoIDE(ctk.CTk):
         self.terminal_box.configure(state="normal")
         self.terminal_box.delete("1.0", "end")
         self.terminal_box.configure(state="disabled")
+
+    def run_tests(self):
+        tab = self.active_tab()
+        if not tab or tab.is_generating:
+            return
+        root = tab.root
+        cmd = None
+        if os.path.isfile(os.path.join(root, "pytest.ini")) or \
+           os.path.isfile(os.path.join(root, "conftest.py")) or \
+           any(f.startswith("test_") and f.endswith(".py") for f in os.listdir(root)):
+            cmd = "python3 -m pytest -q --tb=short"
+        elif os.path.isfile(os.path.join(root, "package.json")):
+            try:
+                with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+                    pkg = json.load(f)
+                if "test" in pkg.get("scripts", {}):
+                    cmd = "npm test"
+            except (OSError, json.JSONDecodeError):
+                pass
+        if not cmd:
+            self.append_chat("No test suite detected (pytest / npm test).", tag="system")
+            return
+        self.append_chat(f"🧪 Running: {cmd}", tag="system")
+        self.run_tests_btn.configure(state="disabled", text="… running")
+
+        def bg():
+            try:
+                r = subprocess.run(cmd, shell=True, cwd=root, capture_output=True,
+                                   text=True, timeout=180)
+                out = (r.stdout + r.stderr).strip()
+                ok = r.returncode == 0
+                summary = "✅ All tests passed." if ok else f"❌ Tests failed (exit {r.returncode})."
+                tail = "\n".join(out.splitlines()[-25:])
+                self.after(0, lambda: (self.append_chat(summary, tag="success" if ok else "error"),
+                                       self.append_chat(tail, tag="observation"),
+                                       self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
+            except subprocess.TimeoutExpired:
+                self.after(0, lambda: (self.append_chat("❌ Tests timed out (180s).", tag="error"),
+                                       self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
+            except OSError as e:
+                self.after(0, lambda: (self.append_chat(f"❌ {e}", tag="error"),
+                                       self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
+        threading.Thread(target=bg, daemon=True).start()
 
     def _render_terminal(self, tab):
         self.terminal_box.configure(state="normal")
@@ -1506,6 +1993,60 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"🖼️ Image attached: {os.path.basename(path)}", tag="system")
             self._sync_attachment_ui()
 
+    def paste_image(self, event=None):
+        try:
+            from PIL import ImageGrab
+        except ImportError:
+            return
+        try:
+            img = ImageGrab.grabclipboard()
+        except Exception:
+            return
+        if img is None:
+            return
+        tab = self.active_tab()
+        if not tab:
+            return
+        tmp = os.path.join(tab.root, ".mimo_paste.png")
+        try:
+            img.save(tmp, "PNG")
+        except Exception:
+            return
+        tab.attached_image = tmp
+        self.append_chat("🖼️ Image pasted from clipboard", tag="system")
+        self._sync_attachment_ui()
+
+    def gui_undo(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        ckpt = os.path.join(tab.root, ".agent_checkpoints")
+        if not os.path.isdir(ckpt) or not os.listdir(ckpt):
+            self.append_chat("Nothing to undo — no checkpoints yet.", tag="system")
+            return
+        py = get_agent_python()
+        if not py:
+            self.append_chat("❌ No python with the 'ollama' package found.", tag="error")
+            return
+        self.append_chat("↩ Undoing last agent change…", tag="system")
+
+        def bg():
+            try:
+                r = subprocess.run(
+                    [py, "-c",
+                     "import sys; sys.path.insert(0, r'/Users/user/Desktop/ai-agent'); "
+                     "import agent; agent.WORKDIR = sys.argv[1]; "
+                     "print(agent.execute('undo', {}))",
+                     tab.root],
+                    capture_output=True, text=True, timeout=30, cwd=tab.root)
+                out = (r.stdout or r.stderr or "").strip()
+                self.after(0, lambda: (self.append_chat(out or "Undo done.", tag="observation"),
+                                       self._render_files(tab),
+                                       self.refresh_changes_panel(silent=True)))
+            except Exception as e:
+                self.after(0, lambda: self.append_chat(f"❌ Undo failed: {e}", tag="error"))
+        threading.Thread(target=bg, daemon=True).start()
+
     def _sync_attachment_ui(self):
         tab = self.active_tab()
         attached = bool(tab and tab.attached_image)
@@ -1568,6 +2109,17 @@ class MimoIDE(ctk.CTk):
 
     def _on_input_click(self, _event):
         self.after(0, self._focus_input)
+
+    def _on_input_paste(self, _event=None):
+        try:
+            from PIL import ImageGrab
+            img = ImageGrab.grabclipboard()
+            if img is not None:
+                self.paste_image()
+                return "break"
+        except Exception:
+            pass
+        return None
 
     def _focus_input(self):
         try:
@@ -1788,11 +2340,14 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"↩ Resuming session {tab.session_id}", tag="system", tab=tab)
             cmd += ["--resume", tab.session_id]
         cmd += ["-p", full_goal]
+        env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        s = self.settings
+        if s.get("ollama_host"):
+            env["OLLAMA_HOST"] = s["ollama_host"]
         try:
             tab.proc = subprocess.Popen(
                 cmd, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                text=True, bufsize=1, cwd=tab.root,
-                env={**os.environ, "PYTHONUNBUFFERED": "1"})
+                text=True, bufsize=1, cwd=tab.root, env=env)
             for raw in tab.proc.stdout:
                 if tab.stop_requested:
                     break
