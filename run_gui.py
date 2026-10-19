@@ -748,8 +748,13 @@ class MimoIDE(ctk.CTk):
                          lmargin1=16, spacing1=8, spacing3=4)
         tb.tag_configure("h2", foreground=TEXT, font=ctk.CTkFont(size=15, weight="bold"),
                          lmargin1=16, spacing1=6, spacing3=3)
+        tb.tag_configure("hr", foreground="#444444", lmargin1=16, spacing1=2, spacing3=2)
         tb.tag_configure("bullet", foreground=TEXT, font=ctk.CTkFont(size=13),
                          lmargin1=40, lmargin2=40, spacing3=2)
+        tb.tag_configure("num", foreground=GOLD, font=ctk.CTkFont(size=13, weight="bold"),
+                         lmargin1=40, lmargin2=40, spacing3=2)
+        tb.tag_configure("quote", foreground="#AAAAAA", font=ctk.CTkFont(size=12, slant="italic"),
+                         lmargin1=48, lmargin2=48, rmargin=16, spacing3=4)
         tb.tag_configure("code", foreground="#D4D4D4", background="#0A0A0A",
                          font=ctk.CTkFont(family="Menlo", size=12),
                          lmargin1=16, lmargin2=16, rmargin=16, spacing1=4, spacing3=4)
@@ -798,6 +803,16 @@ class MimoIDE(ctk.CTk):
             code_buf = []
             tb.insert("end", "\n")
 
+        def flush_table(buf):
+            if not buf:
+                return
+            rows = [r.strip() for r in buf if r.strip() and not re.match(r"^\|[\s\-:|]+\|$", r)]
+            for r in rows:
+                cells = [c.strip() for c in r.strip("|").split("|")]
+                tb.insert("end", "  ".join(f"{c:<22}" for c in cells).rstrip() + "\n", "code")
+            tb.insert("end", "\n")
+
+        table_buf = []
         while i < len(lines):
             line = lines[i]
             s = line.strip()
@@ -807,6 +822,8 @@ class MimoIDE(ctk.CTk):
                     in_code = False
                 else:
                     flush_para()
+                    flush_table(table_buf)
+                    table_buf = []
                     in_code = True
                 i += 1
                 continue
@@ -814,15 +831,55 @@ class MimoIDE(ctk.CTk):
                 code_buf.append(line)
                 i += 1
                 continue
+            if s.startswith("|") and s.endswith("|") and len(s) > 2:
+                flush_para()
+                table_buf.append(s)
+                i += 1
+                continue
+            if table_buf:
+                flush_table(table_buf)
+                table_buf = []
             if s.startswith("#"):
                 flush_para()
                 lvl = len(s) - len(s.lstrip("#"))
-                tb.insert("end", s.lstrip("#").strip() + "\n", "h1" if lvl <= 1 else "h2")
+                title = s.lstrip("#").strip()
+                tag = "h1" if lvl <= 1 else "h2"
+                tb.insert("end", title + "\n", tag)
+                if lvl <= 1:
+                    tb.insert("end", "─" * min(len(title), 60) + "\n", "hr")
                 i += 1
                 continue
-            if s.startswith(("- ", "* ", "• ")):
+            if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
                 flush_para()
-                tb.insert("end", "• " + s[2:] + "\n", "bullet")
+                tb.insert("end", "─" * 50 + "\n", "hr")
+                i += 1
+                continue
+            if s.startswith(">"):
+                flush_para()
+                tb.insert("end", "  │ " + s.lstrip("> ").strip() + "\n", "quote")
+                i += 1
+                continue
+            if s.startswith(("- [ ] ", "- [x] ")):
+                flush_para()
+                mark = "☐" if s[3] == " " else "☑"
+                tb.insert("end", f"  {mark} ", "bullet")
+                self._insert_inline(s[6:], base_tag)
+                tb.insert("end", "\n")
+                i += 1
+                continue
+            m = re.match(r"^(\s*)([-*•]|\d+\.)\s+(.*)$", line)
+            if m:
+                flush_para()
+                indent = len(m.group(1))
+                marker = m.group(2)
+                content = m.group(3)
+                pad = "  " * (indent // 2)
+                if marker.isdigit() or marker.rstrip(".").isdigit():
+                    tb.insert("end", f"{pad}{marker} ", "num")
+                else:
+                    tb.insert("end", f"{pad}• ", "bullet")
+                self._insert_inline(content, base_tag)
+                tb.insert("end", "\n")
                 i += 1
                 continue
             if not s:
@@ -832,6 +889,7 @@ class MimoIDE(ctk.CTk):
             para.append(s)
             i += 1
         flush_para()
+        flush_table(table_buf)
         if in_code:
             flush_code()
 
@@ -1656,7 +1714,9 @@ class MimoIDE(ctk.CTk):
             return "error", stripped
         if stripped.startswith("exit code:") and "exit code: 0" not in stripped[:20]:
             return "error", stripped
-        if stripped.startswith("OK:") or stripped.startswith("exit code: 0"):
+        if stripped.startswith("exit code: 0"):
+            return "silent", stripped
+        if stripped.startswith("OK:"):
             return "observation", stripped
         if stripped.startswith(("plan saved", "Stopped:", "Use /model", "Say 'continue'",
                                 "No saved session")):
@@ -1718,6 +1778,8 @@ class MimoIDE(ctk.CTk):
                 if self._route_to_work_card(line, tab):
                     continue
                 tag, text = self._classify_engine_line(line)
+                if tag == "silent":
+                    continue
                 self.append_chat(text, tag=tag, tab=tab)
             tab.proc.wait()
             if tab.stop_requested:
