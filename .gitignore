@@ -1,0 +1,6 @@
+__pycache__/
+.agent_sessions/
+.agent_checkpoints/
+PLAN.md
+run_gui.py.bak
+.claude/
