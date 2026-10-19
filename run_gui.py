@@ -505,19 +505,23 @@ class MimoIDE(ctk.CTk):
         self.user_input = ctk.CTkTextbox(input_wrap, height=52, fg_color="transparent",
                                          text_color=TEXT, wrap="word",
                                          font=ctk.CTkFont(size=13), corner_radius=10)
-        self.user_input.grid(row=0, column=0, sticky="ew", padx=(12, 4), pady=6)
+        self.user_input.grid(row=0, column=0, sticky="nsew", padx=(12, 4), pady=6)
+        input_wrap.grid_rowconfigure(0, weight=1)
         self.user_input.bind("<Return>", self._on_input_return)
         self.user_input.bind("<Shift-Return>", self._on_input_shift_return)
         self.user_input.bind("<KeyRelease>", self._on_input_keyrelease, add="+")
         self.user_input.bind("<FocusIn>", self._on_input_focus_in, add="+")
         self.user_input.bind("<FocusOut>", self._on_input_focus_out, add="+")
+        self.user_input._textbox.bind("<Button-1>", self._on_input_click, add="+")
+        input_wrap.bind("<Button-1>", lambda _e: self.user_input.focus_set())
         self.input_hint = ctk.CTkLabel(input_wrap,
                                        text="Describe a task, ask a question, or attach an image…   "
                                             "⏎ run  ·  ⇧⏎ newline",
                                        text_color="#666", font=ctk.CTkFont(size=12),
                                        anchor="w")
         self.input_hint.place(relx=0, rely=0.5, anchor="w", x=14)
-        self.input_hint.bind("<Button-1>", lambda _e: self.user_input.focus_set())
+        self.input_hint.lower()
+        self.input_hint.bind("<Button-1>", lambda _e: self._focus_input())
 
         self.img_button = ctk.CTkButton(self.input_frame, text="🖼", width=48, height=48,
                                         fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
@@ -755,6 +759,12 @@ class MimoIDE(ctk.CTk):
                          lmargin1=40, lmargin2=40, spacing3=2)
         tb.tag_configure("quote", foreground="#AAAAAA", font=ctk.CTkFont(size=12, slant="italic"),
                          lmargin1=48, lmargin2=48, rmargin=16, spacing3=4)
+        tb.tag_configure("cmd", foreground="#C8C8C8", font=ctk.CTkFont(family="Menlo", size=11),
+                         lmargin1=48, lmargin2=48, spacing3=2)
+        tb.tag_configure("cmdpass", foreground=GREEN, font=ctk.CTkFont(size=12, weight="bold"),
+                         lmargin1=32, lmargin2=32, spacing3=2)
+        tb.tag_configure("cmdfail", foreground=RED, font=ctk.CTkFont(size=12, weight="bold"),
+                         lmargin1=32, lmargin2=32, spacing3=2)
         tb.tag_configure("code", foreground="#D4D4D4", background="#0A0A0A",
                          font=ctk.CTkFont(family="Menlo", size=12),
                          lmargin1=16, lmargin2=16, rmargin=16, spacing1=4, spacing3=4)
@@ -852,6 +862,17 @@ class MimoIDE(ctk.CTk):
             if re.match(r"^(-{3,}|\*{3,}|_{3,})$", s):
                 flush_para()
                 tb.insert("end", "─" * 50 + "\n", "hr")
+                i += 1
+                continue
+            m = re.match(r"^\$\s+(.+?)\s*→\s*exit\s+(\d+)", s)
+            if m:
+                flush_para()
+                cmd, code = m.group(1), int(m.group(2))
+                mark = "✓" if code == 0 else "✗"
+                col = "cmdpass" if code == 0 else "cmdfail"
+                tb.insert("end", f"  {mark} ", col)
+                tb.insert("end", cmd, "cmd")
+                tb.insert("end", "\n")
                 i += 1
                 continue
             if s.startswith(">"):
@@ -1544,6 +1565,16 @@ class MimoIDE(ctk.CTk):
 
     def _on_input_focus_out(self, _event):
         self._refresh_input_hint()
+
+    def _on_input_click(self, _event):
+        self.after(0, self._focus_input)
+
+    def _focus_input(self):
+        try:
+            self.user_input._textbox.focus_set()
+            self.user_input.focus_set()
+        except Exception:
+            pass
 
     def _refresh_input_hint(self):
         text = self.user_input.get("1.0", "end-1c").strip()
