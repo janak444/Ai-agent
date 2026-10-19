@@ -20,16 +20,28 @@ PROJECT_SKIP_DIRS = {'.git', '.vscode', '__pycache__', 'node_modules', 'venv', '
                      'agent-env', '.idea', '.mypy_cache', '.pytest_cache', '.ruff_cache'}
 MAX_TRANSCRIPT = 600
 RECENT_PROJECTS_FILE = os.path.expanduser("~/.mimo_ide_projects.json")
+GEOM_FILE = os.path.expanduser("~/.mimo_ide_geometry.json")
 
-BG = "#171717"
-PANEL = "#1F1F1F"
-CARD = "#262626"
-ACTIVE = "#2F2F2F"
+BG = "#121212"
+PANEL = "#1A1A1A"
+CARD = "#242424"
+ACTIVE = "#2E2E2E"
 GOLD = "#F9A825"
-TEXT = "#EAEAEA"
-MUTED = "#9E9E9E"
+GOLD_DIM = "#3A2E10"
+TEXT = "#E8E8E8"
+MUTED = "#8A8A8A"
 GREEN = "#66BB6A"
 RED = "#EF5350"
+BLUE = "#64B5F6"
+
+MAIN_TAB_NAMES = ("Chat", "Editor", "Terminal", "Changes", "Git")
+
+STARTERS = (
+    ("🔍  Check if this project works", "Check if this project works. Run the tests and fix any failures."),
+    ("✨  Add a feature", "Add a small, useful feature to this project and verify it works."),
+    ("🐛  Find and fix a bug", "Look for a real bug in this project, fix it, and prove the fix with a test."),
+    ("📖  Explain this codebase", "Explain what this codebase does, its main modules, and how to run it."),
+)
 
 _agent_py_cache = {"value": None}
 _agent_py_lock = threading.Lock()
@@ -57,6 +69,73 @@ def get_agent_python():
         return _agent_py_cache["value"]
 
 
+def _load_geometry():
+    try:
+        with open(GEOM_FILE, encoding="utf-8") as f:
+            g = json.load(f)
+        if all(isinstance(g.get(k), int) for k in ("w", "h")):
+            return g
+    except (OSError, json.JSONDecodeError, TypeError):
+        pass
+    return None
+
+
+def _save_geometry(app):
+    try:
+        with open(GEOM_FILE, "w", encoding="utf-8") as f:
+            json.dump({"w": app.winfo_width(), "h": app.winfo_height(),
+                       "x": app.winfo_x(), "y": app.winfo_y()}, f)
+    except OSError:
+        pass
+
+
+class Tooltip:
+    """Lightweight hover tooltip for any CTk widget."""
+
+    def __init__(self, widget, text):
+        self.widget = widget
+        self.text = text
+        self._tip = None
+        self._after_id = None
+        widget.bind("<Enter>", self._schedule, add="+")
+        widget.bind("<Leave>", self._hide, add="+")
+
+    def _schedule(self, _event=None):
+        self._after_id = self.widget.after(500, self._show)
+
+    def _show(self):
+        if self._tip is not None or not self.text:
+            return
+        try:
+            x = self.widget.winfo_rootx() + 12
+            y = self.widget.winfo_rooty() + self.widget.winfo_height() + 8
+            tip = ctk.CTkToplevel(self.widget)
+            tip.wm_overrideredirect(True)
+            tip.wm_geometry(f"+{x}+{y}")
+            tip.attributes("-topmost", True)
+            lbl = ctk.CTkLabel(tip, text=self.text, fg_color="#000", text_color="#FFF",
+                               corner_radius=6, padx=10, pady=5,
+                               font=ctk.CTkFont(size=11))
+            lbl.pack()
+            self._tip = tip
+        except Exception:
+            self._tip = None
+
+    def _hide(self, _event=None):
+        if self._after_id is not None:
+            try:
+                self.widget.after_cancel(self._after_id)
+            except Exception:
+                pass
+            self._after_id = None
+        if self._tip is not None:
+            try:
+                self._tip.destroy()
+            except Exception:
+                pass
+            self._tip = None
+
+
 # ------------------------------------------------------------- project tab --
 class ProjectTab:
     """All state for one open project. Tabs are fully independent."""
@@ -78,12 +157,17 @@ class ProjectTab:
         self.editor_path = None
         self.editor_text = ""
         self.editor_widget = None
+        self.editor_dirty = False
         self.raw_log = []
         self.changed_files = {}
         self.git_root = None
         self.git_branch = ""
         self.git_dirty = 0
         self.git_log = []
+        self.run_started = 0.0
+        self.cur_phase = ""
+        self.cur_step = ""
+        self.cur_action = ""
 
 
 # --------------------------------------------------------------------- app --
@@ -92,14 +176,19 @@ class MimoIDE(ctk.CTk):
 
     def __init__(self):
         super().__init__()
-        self.title("Mimo-Agentic IDE | Multimodal AI Engineer")
-        self.geometry("1440x920")
+        self.title("Mimo Agentic IDE")
+        ctk.set_appearance_mode("dark")
+        ctk.set_default_color_theme("dark-blue")
+
+        geom = _load_geometry()
+        if geom:
+            self.geometry(f"{geom['w']}x{geom['h']}+{geom['x']}+{geom['y']}")
+        else:
+            self.geometry("1480x940")
+        self.minsize(1100, 700)
         self.configure(fg_color=BG)
         self.lift()
         self.focus_force()
-
-        ctk.set_appearance_mode("dark")
-        ctk.set_default_color_theme("dark-blue")
 
         self.tabs = []
         self.active_index = 0
@@ -111,6 +200,7 @@ class MimoIDE(ctk.CTk):
         }
 
         self._build_ui()
+        self._bind_shortcuts()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
         self.add_project_tab(self._initial_project())
         self.refresh_available_models()
@@ -118,8 +208,7 @@ class MimoIDE(ctk.CTk):
 
     # ---------------------------------------------------------- helpers --
     def _initial_project(self):
-        cwd = os.getcwd()
-        return cwd
+        return os.getcwd()
 
     def active_tab(self):
         if 0 <= self.active_index < len(self.tabs):
@@ -131,84 +220,101 @@ class MimoIDE(ctk.CTk):
         self.grid_rowconfigure(1, weight=1)
         self.grid_columnconfigure(1, weight=1)
 
-        # --- project tab bar (row 0, spans both columns) ---
-        self.tab_bar = ctk.CTkFrame(self, height=44, corner_radius=0, fg_color=PANEL)
+        # --- project tab bar ---
+        self.tab_bar = ctk.CTkFrame(self, height=46, corner_radius=0, fg_color=PANEL)
         self.tab_bar.grid(row=0, column=0, columnspan=2, sticky="ew")
+        brand = ctk.CTkLabel(self.tab_bar, text="◈ MIMO", text_color=GOLD,
+                             font=ctk.CTkFont(size=14, weight="bold"))
+        brand.pack(side="left", padx=(14, 10))
         self.tab_bar_inner = ctk.CTkFrame(self.tab_bar, fg_color="transparent")
-        self.tab_bar_inner.pack(side="left", fill="x", expand=True, padx=8, pady=6)
+        self.tab_bar_inner.pack(side="left", fill="x", expand=True, pady=7)
         self.add_tab_btn = ctk.CTkButton(self.tab_bar, text="＋", width=36, height=30,
                                          fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
                                          font=ctk.CTkFont(size=16, weight="bold"),
                                          command=self._add_project_dialog)
-        self.add_tab_btn.pack(side="right", padx=(4, 12), pady=6)
+        self.add_tab_btn.pack(side="right", padx=(4, 14), pady=7)
+        Tooltip(self.add_tab_btn, "Open a project (recent list)")
 
-        # --- sidebar (row 1, col 0) — contextual to active tab ---
-        self.sidebar = ctk.CTkFrame(self, width=270, corner_radius=0, fg_color=PANEL)
+        # --- sidebar ---
+        self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=PANEL)
         self.sidebar.grid(row=1, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(6, weight=1)
-        self.sidebar.grid_rowconfigure(11, weight=1)
+        self.sidebar.grid_rowconfigure(7, weight=1)
+        self.sidebar.grid_rowconfigure(11, weight=2)
         self.sidebar.grid_columnconfigure(0, weight=1)
 
         self.project_label = ctk.CTkLabel(self.sidebar, text="PROJECT", text_color=GOLD,
-                                          font=ctk.CTkFont(size=11, weight="bold"))
-        self.project_label.grid(row=0, column=0, padx=16, pady=(14, 2), sticky="w")
+                                          font=ctk.CTkFont(size=13, weight="bold"))
+        self.project_label.grid(row=0, column=0, padx=18, pady=(16, 0), sticky="w")
+        self.project_path_label = ctk.CTkLabel(self.sidebar, text="", text_color="#666",
+                                               font=ctk.CTkFont(size=10), anchor="w")
+        self.project_path_label.grid(row=0, column=0, padx=18, pady=(34, 0), sticky="w")
 
-        self.model_label = ctk.CTkLabel(self.sidebar, text="Active Brain", text_color=MUTED,
-                                        font=ctk.CTkFont(size=11))
-        self.model_label.grid(row=1, column=0, padx=16, pady=(10, 0), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="◈ Brain", text_color=MUTED,
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).grid(row=1, column=0, padx=18, pady=(14, 0), sticky="w")
         self.model_dropdown = ctk.CTkOptionMenu(
             self.sidebar, values=list(self.models_inventory.values()),
             command=self.change_model, fg_color=ACTIVE, button_color=GOLD,
             button_hover_color="#FFB300", text_color=TEXT, dropdown_fg_color=CARD,
-            dropdown_text_color=TEXT, height=32)
-        self.model_dropdown.grid(row=2, column=0, padx=16, pady=(4, 8), sticky="ew")
+            dropdown_text_color=TEXT, height=34)
+        self.model_dropdown.grid(row=2, column=0, padx=14, pady=(6, 4), sticky="ew")
 
-        self.sessions_label = ctk.CTkLabel(self.sidebar, text="Sessions", text_color=MUTED,
-                                           font=ctk.CTkFont(size=11))
-        self.sessions_label.grid(row=3, column=0, padx=16, pady=(8, 0), sticky="w")
+        ctk.CTkLabel(self.sidebar, text="◈ Sessions", text_color=MUTED,
+                     font=ctk.CTkFont(size=11, weight="bold")
+                     ).grid(row=3, column=0, padx=18, pady=(10, 0), sticky="w")
         row4 = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        row4.grid(row=4, column=0, padx=16, pady=(4, 8), sticky="ew")
+        row4.grid(row=4, column=0, padx=14, pady=(6, 4), sticky="ew")
         row4.grid_columnconfigure(0, weight=1)
         self.sessions_dropdown = ctk.CTkOptionMenu(
             row4, values=["(new chat)"], command=self.on_session_selected,
             fg_color=ACTIVE, button_color=GOLD, button_hover_color="#FFB300",
             text_color=TEXT, dropdown_fg_color=CARD, dropdown_text_color=TEXT,
-            height=32, dynamic_resizing=False, width=170)
+            height=34, dynamic_resizing=False, width=170)
         self.sessions_dropdown.grid(row=0, column=0, sticky="ew")
-        self.new_chat_btn = ctk.CTkButton(row4, text="＋", width=32, height=32,
+        self.new_chat_btn = ctk.CTkButton(row4, text="＋", width=34, height=34,
                                           fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
                                           font=ctk.CTkFont(size=15, weight="bold"),
                                           command=self.new_chat)
         self.new_chat_btn.grid(row=0, column=1, padx=(6, 0))
+        Tooltip(self.new_chat_btn, "New chat  (⌘N)")
 
         tasks_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        tasks_hdr.grid(row=5, column=0, padx=16, pady=(8, 0), sticky="ew")
+        tasks_hdr.grid(row=5, column=0, padx=18, pady=(12, 0), sticky="ew")
         tasks_hdr.grid_columnconfigure(0, weight=1)
-        self.tasks_label = ctk.CTkLabel(tasks_hdr, text="Tasks", text_color=MUTED,
-                                        font=ctk.CTkFont(size=11))
+        self.tasks_label = ctk.CTkLabel(tasks_hdr, text="◈ Tasks", text_color=MUTED,
+                                        font=ctk.CTkFont(size=11, weight="bold"))
         self.tasks_label.grid(row=0, column=0, sticky="w")
         self.tasks_expand_btn = ctk.CTkButton(tasks_hdr, text="⤢", width=30, height=22,
                                               fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
                                               font=ctk.CTkFont(size=13),
                                               command=self._open_tasks_expanded)
         self.tasks_expand_btn.grid(row=0, column=1, padx=(6, 0))
-        self.tasks_container = ctk.CTkScrollableFrame(self.sidebar, width=230,
+        self.tasks_container = ctk.CTkScrollableFrame(self.sidebar, width=240,
                                                       fg_color=PANEL, label_text="")
-        self.tasks_container.grid(row=6, column=0, padx=8, pady=(4, 4), sticky="nsew")
+        self.tasks_container.grid(row=7, column=0, padx=10, pady=(6, 4), sticky="nsew")
 
-        self.files_label = ctk.CTkLabel(self.sidebar, text="Files", text_color=MUTED,
-                                        font=ctk.CTkFont(size=11))
-        self.files_label.grid(row=7, column=0, padx=16, pady=(10, 0), sticky="w")
-        self.project_btn = ctk.CTkButton(self.sidebar, text="📁 Open Project", height=30,
+        files_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        files_hdr.grid(row=8, column=0, padx=18, pady=(10, 0), sticky="ew")
+        files_hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(files_hdr, text="◈ Files", text_color=MUTED,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.project_btn = ctk.CTkButton(files_hdr, text="Open…", width=64, height=22,
                                          fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
+                                         font=ctk.CTkFont(size=11),
                                          command=self._add_project_dialog)
-        self.project_btn.grid(row=8, column=0, padx=16, pady=(6, 2), sticky="ew")
-        self.files_container = ctk.CTkScrollableFrame(self.sidebar, width=230, fg_color=PANEL)
-        self.files_container.grid(row=9, column=0, rowspan=3, padx=8, pady=(4, 8), sticky="nsew")
+        self.project_btn.grid(row=0, column=1, padx=(6, 0))
+        self.files_filter = ctk.CTkEntry(self.sidebar, height=28, fg_color=CARD,
+                                         placeholder_text="Filter files…",
+                                         placeholder_text_color="#666", border_color=ACTIVE,
+                                         text_color=TEXT)
+        self.files_filter.grid(row=9, column=0, padx=14, pady=(6, 2), sticky="ew")
+        self.files_filter.bind("<KeyRelease>", self._on_files_filter)
+        self.files_container = ctk.CTkScrollableFrame(self.sidebar, width=240, fg_color=PANEL)
+        self.files_container.grid(row=11, column=0, padx=10, pady=(2, 10), sticky="nsew")
 
-        # --- main area (row 1, col 1) ---
+        # --- main area ---
         self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
-        self.main.grid(row=1, column=1, sticky="nsew", padx=0, pady=0)
+        self.main.grid(row=1, column=1, sticky="nsew")
         self.main.grid_rowconfigure(0, weight=1)
         self.main.grid_columnconfigure(0, weight=1)
 
@@ -216,21 +322,36 @@ class MimoIDE(ctk.CTk):
                                         segmented_button_selected_color=ACTIVE,
                                         segmented_button_selected_hover_color=ACTIVE,
                                         text_color=TEXT)
-        self.main_tabs.grid(row=0, column=0, sticky="nsew", padx=14, pady=(12, 8))
+        self.main_tabs.grid(row=0, column=0, sticky="nsew", padx=16, pady=(12, 8))
         self.chat_tab = self.main_tabs.add("Chat")
         self.editor_tab = self.main_tabs.add("Editor")
         self.terminal_tab = self.main_tabs.add("Terminal")
         self.changes_tab = self.main_tabs.add("Changes")
         self.git_tab = self.main_tabs.add("Git")
 
-        # Chat tab
+        # Chat tab: header + display/welcome stack
         self.chat_tab.grid_columnconfigure(0, weight=1)
-        self.chat_tab.grid_rowconfigure(0, weight=1)
-        self.chat_display = ctk.CTkTextbox(self.chat_tab, fg_color="#121212", text_color=TEXT,
+        self.chat_tab.grid_rowconfigure(1, weight=1)
+        chat_hdr = ctk.CTkFrame(self.chat_tab, fg_color="transparent", height=28)
+        chat_hdr.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        chat_hdr.grid_columnconfigure(0, weight=1)
+        self.chat_ctx_label = ctk.CTkLabel(chat_hdr, text="", text_color=MUTED,
+                                           font=ctk.CTkFont(size=11), anchor="w")
+        self.chat_ctx_label.grid(row=0, column=0, sticky="w")
+        self.model_badge = ctk.CTkLabel(chat_hdr, text="qwen3-coder:30b", text_color="#000",
+                                        fg_color=GOLD, corner_radius=10, padx=10, pady=2,
+                                        font=ctk.CTkFont(size=10, weight="bold"))
+        self.model_badge.grid(row=0, column=1, padx=(8, 0))
+
+        self.chat_display = ctk.CTkTextbox(self.chat_tab, fg_color="#0E0E0E", text_color=TEXT,
                                            wrap="word", font=ctk.CTkFont(size=13))
-        self.chat_display.grid(row=0, column=0, sticky="nsew")
+        self.chat_display.grid(row=1, column=0, sticky="nsew")
         self.chat_display.configure(state="disabled")
         self._setup_chat_tags()
+
+        self.welcome_frame = ctk.CTkFrame(self.chat_tab, fg_color="#0E0E0E", corner_radius=0)
+        self.welcome_frame.grid(row=1, column=0, sticky="nsew")
+        self._build_welcome()
 
         # Editor tab
         self.editor_tab.grid_columnconfigure(0, weight=1)
@@ -239,34 +360,46 @@ class MimoIDE(ctk.CTk):
         ebar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         ebar.grid_columnconfigure(0, weight=1)
         self.editor_path_label = ctk.CTkLabel(ebar, text="No file open", text_color=MUTED,
-                                              font=ctk.CTkFont(family="Menlo", size=12))
+                                              font=ctk.CTkFont(family="Menlo", size=12),
+                                              anchor="w")
         self.editor_path_label.grid(row=0, column=0, sticky="w")
         self.editor_save_btn = ctk.CTkButton(ebar, text="💾 Save", width=90, height=28,
-                                             fg_color=GOLD, text_color="#000",
-                                             hover_color="#FFB300", command=self.save_editor)
+                                             fg_color=CARD, text_color=TEXT,
+                                             hover_color=ACTIVE, command=self.save_editor)
         self.editor_save_btn.grid(row=0, column=1, padx=(8, 0))
-        self.editor_box = ctk.CTkTextbox(self.editor_tab, fg_color="#121212", text_color="#D4D4D4",
+        Tooltip(self.editor_save_btn, "Save file  (⌘S)")
+        self.editor_box = ctk.CTkTextbox(self.editor_tab, fg_color="#0E0E0E", text_color="#D4D4D4",
                                          font=ctk.CTkFont(family="Menlo", size=13),
                                          wrap="none")
         self.editor_box.grid(row=1, column=0, sticky="nsew")
+        self.editor_box.bind("<KeyRelease>", self._mark_editor_dirty, add="+")
 
-        # Terminal tab — raw engine stream
+        # Terminal tab
         self.terminal_tab.grid_columnconfigure(0, weight=1)
-        self.terminal_tab.grid_rowconfigure(0, weight=1)
-        self.terminal_box = ctk.CTkTextbox(self.terminal_tab, fg_color="#0D0D0D",
+        self.terminal_tab.grid_rowconfigure(1, weight=1)
+        tbar = ctk.CTkFrame(self.terminal_tab, fg_color="transparent")
+        tbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        tbar.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(tbar, text="Raw agent stream", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        self.terminal_clear_btn = ctk.CTkButton(tbar, text="Clear", width=70, height=26,
+                                                fg_color=CARD, hover_color=ACTIVE,
+                                                text_color=TEXT, command=self._clear_terminal)
+        self.terminal_clear_btn.grid(row=0, column=1, padx=(8, 0))
+        self.terminal_box = ctk.CTkTextbox(self.terminal_tab, fg_color="#0A0A0A",
                                            text_color="#B8B8B8",
                                            font=ctk.CTkFont(family="Menlo", size=12),
                                            wrap="char")
-        self.terminal_box.grid(row=0, column=0, sticky="nsew")
+        self.terminal_box.grid(row=1, column=0, sticky="nsew")
         self.terminal_box.configure(state="disabled")
 
-        # Changes tab — recent file changes with diffs
+        # Changes tab
         self.changes_tab.grid_columnconfigure(0, weight=1)
         self.changes_tab.grid_rowconfigure(1, weight=1)
         cbar = ctk.CTkFrame(self.changes_tab, fg_color="transparent")
         cbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
         cbar.grid_columnconfigure(0, weight=1)
-        self.changes_title = ctk.CTkLabel(cbar, text="Recent changes", text_color=MUTED,
+        self.changes_title = ctk.CTkLabel(cbar, text="Working tree", text_color=MUTED,
                                           font=ctk.CTkFont(size=11))
         self.changes_title.grid(row=0, column=0, sticky="w")
         self.changes_refresh_btn = ctk.CTkButton(cbar, text="⟳ Refresh", width=90, height=26,
@@ -277,14 +410,14 @@ class MimoIDE(ctk.CTk):
         changes_split.grid(row=1, column=0, sticky="nsew")
         changes_split.grid_columnconfigure(1, weight=1)
         changes_split.grid_rowconfigure(0, weight=1)
-        self.changes_list = ctk.CTkScrollableFrame(changes_split, width=250, fg_color=PANEL)
+        self.changes_list = ctk.CTkScrollableFrame(changes_split, width=260, fg_color=PANEL)
         self.changes_list.grid(row=0, column=0, sticky="nsew", padx=(0, 8))
-        self.diff_box = ctk.CTkTextbox(changes_split, fg_color="#0D0D0D", text_color="#D4D4D4",
+        self.diff_box = ctk.CTkTextbox(changes_split, fg_color="#0A0A0A", text_color="#D4D4D4",
                                        font=ctk.CTkFont(family="Menlo", size=12), wrap="none")
         self.diff_box.grid(row=0, column=1, sticky="nsew")
         self.diff_box.configure(state="disabled")
 
-        # Git tab — repo status, log, quick actions
+        # Git tab
         self.git_tab.grid_columnconfigure(0, weight=1)
         self.git_tab.grid_rowconfigure(3, weight=1)
         gbar = ctk.CTkFrame(self.git_tab, fg_color="transparent")
@@ -304,15 +437,17 @@ class MimoIDE(ctk.CTk):
         self.git_refresh_btn.grid(row=0, column=2, padx=(6, 0))
         git_actions = ctk.CTkFrame(self.git_tab, fg_color="transparent")
         git_actions.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        for text, cmd in [("Commit all", self.git_commit_all),
-                          ("Pull", self.git_pull),
-                          ("Push", self.git_push)]:
+        for text, cmd, tip in [("Commit all", self.git_commit_all, "git add -A && git commit"),
+                               ("Pull", self.git_pull, "git pull"),
+                               ("Push", self.git_push, "git push")]:
             b = ctk.CTkButton(git_actions, text=text, width=110, height=30,
                               fg_color=CARD, hover_color=ACTIVE, text_color=TEXT, command=cmd)
             b.pack(side="left", padx=(0, 6))
+            Tooltip(b, tip)
         self.git_commit_msg = ctk.CTkEntry(git_actions, height=30, fg_color=CARD,
                                            placeholder_text="Commit message…",
-                                           placeholder_text_color=MUTED, border_color=ACTIVE)
+                                           placeholder_text_color=MUTED, border_color=ACTIVE,
+                                           text_color=TEXT)
         self.git_commit_msg.pack(side="left", fill="x", expand=True, padx=(6, 0))
         git_log_wrap = ctk.CTkFrame(self.git_tab, fg_color="transparent")
         git_log_wrap.grid(row=3, column=0, sticky="nsew")
@@ -320,34 +455,128 @@ class MimoIDE(ctk.CTk):
         git_log_wrap.grid_rowconfigure(1, weight=1)
         ctk.CTkLabel(git_log_wrap, text="Recent commits", text_color=MUTED,
                      font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
-        self.git_log_box = ctk.CTkTextbox(git_log_wrap, fg_color="#0D0D0D", text_color="#D4D4D4",
+        self.git_log_box = ctk.CTkTextbox(git_log_wrap, fg_color="#0A0A0A", text_color="#D4D4D4",
                                           font=ctk.CTkFont(family="Menlo", size=12))
         self.git_log_box.grid(row=1, column=0, sticky="nsew", pady=(4, 0))
         self.git_log_box.configure(state="disabled")
 
-        # Input area
+        # --- input area ---
         self.input_frame = ctk.CTkFrame(self.main, fg_color=BG, corner_radius=0)
-        self.input_frame.grid(row=1, column=0, sticky="ew", padx=14, pady=(0, 4))
+        self.input_frame.grid(row=1, column=0, sticky="ew", padx=16, pady=(0, 6))
         self.input_frame.grid_columnconfigure(0, weight=1)
-        self.user_input = ctk.CTkEntry(self.input_frame, height=48, fg_color=CARD,
-                                       text_color=TEXT, placeholder_text="Describe the task or ask about the image...",
-                                       placeholder_text_color=MUTED, border_color=ACTIVE)
-        self.user_input.grid(row=0, column=0, sticky="ew", padx=(0, 10))
-        self.user_input.bind("<Return>", lambda e: self.send_request())
-        self.img_button = ctk.CTkButton(self.input_frame, text="🖼️", width=48, height=48,
+
+        # live work card — in-place status while the agent runs (hidden when idle)
+        self.work_card = ctk.CTkFrame(self.input_frame, fg_color=CARD, corner_radius=10)
+        self.work_card.grid(row=0, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self.work_card.grid_columnconfigure(1, weight=1)
+        self.work_card.grid_remove()
+        self.work_spin = ctk.CTkLabel(self.work_card, text="⠋", text_color=GOLD,
+                                      font=ctk.CTkFont(family="Menlo", size=15, weight="bold"))
+        self.work_spin.grid(row=0, column=0, rowspan=2, padx=(12, 6), pady=8, sticky="n")
+        self.work_phase_lbl = ctk.CTkLabel(self.work_card, text="Starting…", text_color=GOLD,
+                                           font=ctk.CTkFont(size=12, weight="bold"), anchor="w")
+        self.work_phase_lbl.grid(row=0, column=1, sticky="ew", pady=(8, 0))
+        self.work_meta_lbl = ctk.CTkLabel(self.work_card, text="", text_color=MUTED,
+                                          font=ctk.CTkFont(size=11), anchor="w")
+        self.work_meta_lbl.grid(row=1, column=1, sticky="ew", pady=(0, 8))
+        self.work_action_lbl = ctk.CTkLabel(self.work_card, text="", text_color="#B0B0B0",
+                                            font=ctk.CTkFont(family="Menlo", size=11),
+                                            anchor="w")
+        self.work_action_lbl.grid(row=2, column=1, sticky="ew", pady=(0, 8))
+        self.work_stop_btn = ctk.CTkButton(self.work_card, text="■ Stop", width=70, height=26,
+                                           fg_color=RED, hover_color="#D32F2F", text_color="#FFF",
+                                           command=self.stop_generation)
+        self.work_stop_btn.grid(row=0, column=2, rowspan=3, padx=(8, 10), sticky="n")
+
+        self.chip_frame = ctk.CTkFrame(self.input_frame, fg_color=CARD, corner_radius=8, height=30)
+        self.chip_frame.grid(row=1, column=0, columnspan=3, sticky="ew", pady=(0, 6))
+        self.chip_frame.grid_remove()
+        self.chip_label = ctk.CTkLabel(self.chip_frame, text="", text_color=TEXT,
+                                       font=ctk.CTkFont(size=11))
+        self.chip_label.pack(side="left", padx=(10, 4), pady=4)
+        self.chip_clear_btn = ctk.CTkButton(self.chip_frame, text="✕", width=24, height=20,
+                                            fg_color="transparent", hover_color="#4A1A1A",
+                                            text_color=MUTED, command=self._clear_attachment)
+        self.chip_clear_btn.pack(side="left", padx=(0, 8), pady=4)
+
+        input_wrap = ctk.CTkFrame(self.input_frame, fg_color=CARD, corner_radius=10)
+        input_wrap.grid(row=2, column=0, sticky="ew", padx=(0, 10))
+        input_wrap.grid_columnconfigure(0, weight=1)
+        self.user_input = ctk.CTkTextbox(input_wrap, height=52, fg_color="transparent",
+                                         text_color=TEXT, wrap="word",
+                                         font=ctk.CTkFont(size=13), corner_radius=10)
+        self.user_input.grid(row=0, column=0, sticky="ew", padx=(12, 4), pady=6)
+        self.user_input.bind("<Return>", self._on_input_return)
+        self.user_input.bind("<Shift-Return>", self._on_input_shift_return)
+        self.user_input.bind("<KeyRelease>", self._on_input_keyrelease, add="+")
+        self.user_input.bind("<FocusIn>", self._on_input_focus_in, add="+")
+        self.user_input.bind("<FocusOut>", self._on_input_focus_out, add="+")
+        self.input_hint = ctk.CTkLabel(input_wrap,
+                                       text="Describe a task, ask a question, or attach an image…   "
+                                            "⏎ run  ·  ⇧⏎ newline",
+                                       text_color="#666", font=ctk.CTkFont(size=12),
+                                       anchor="w")
+        self.input_hint.place(relx=0, rely=0.5, anchor="w", x=14)
+        self.input_hint.bind("<Button-1>", lambda _e: self.user_input.focus_set())
+
+        self.img_button = ctk.CTkButton(self.input_frame, text="🖼", width=48, height=48,
                                         fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
                                         command=self.upload_image)
-        self.img_button.grid(row=0, column=1, padx=(0, 10))
-        self.send_button = ctk.CTkButton(self.input_frame, text="▶ Run", width=130, height=48,
+        self.img_button.grid(row=2, column=1, padx=(0, 10))
+        Tooltip(self.img_button, "Attach an image for the vision model")
+        self.send_button = ctk.CTkButton(self.input_frame, text="▶  Run", width=120, height=48,
                                          fg_color=GOLD, text_color="#000", hover_color="#FFB300",
                                          font=ctk.CTkFont(weight="bold"), command=self.send_request)
-        self.send_button.grid(row=0, column=2)
+        self.send_button.grid(row=2, column=2)
+        Tooltip(self.send_button, "Send to agent  (⏎)")
 
-        # Status bar
-        self.status_bar = ctk.CTkLabel(self, text="○ idle", height=26, anchor="w",
-                                       fg_color=PANEL, text_color=MUTED,
-                                       font=ctk.CTkFont(size=11), padx=12)
-        self.status_bar.grid(row=2, column=0, columnspan=2, sticky="ew")
+        # --- status bar ---
+        status_wrap = ctk.CTkFrame(self, height=28, corner_radius=0, fg_color=PANEL)
+        status_wrap.grid(row=2, column=0, columnspan=2, sticky="ew")
+        status_wrap.grid_columnconfigure(0, weight=1)
+        self.status_bar = ctk.CTkLabel(status_wrap, text="○ idle", height=26, anchor="w",
+                                       fg_color="transparent", text_color=MUTED,
+                                       font=ctk.CTkFont(size=11), padx=14)
+        self.status_bar.grid(row=0, column=0, sticky="ew")
+        self.shortcut_hint = ctk.CTkLabel(status_wrap,
+                                          text="⌘⏎ send · ⌘N new chat · ⌘T new tab · ⌘1-5 panels · esc stop",
+                                          height=26, anchor="e", fg_color="transparent",
+                                          text_color="#555", font=ctk.CTkFont(size=10), padx=14)
+        self.shortcut_hint.grid(row=0, column=1, sticky="e")
+
+    def _build_welcome(self):
+        inner = ctk.CTkFrame(self.welcome_frame, fg_color="transparent")
+        inner.place(relx=0.5, rely=0.4, anchor="center")
+        ctk.CTkLabel(inner, text="◈ Mimo Agentic IDE", text_color=GOLD,
+                     font=ctk.CTkFont(size=28, weight="bold")).pack(pady=(0, 6))
+        ctk.CTkLabel(inner, text="Your local AI engineer — plans, codes, verifies, and reports.",
+                     text_color=MUTED, font=ctk.CTkFont(size=14)).pack(pady=(0, 22))
+        ctk.CTkLabel(inner, text="Try one of these:", text_color="#666",
+                     font=ctk.CTkFont(size=12)).pack(anchor="w", pady=(0, 8))
+        for label, prompt in STARTERS:
+            btn = ctk.CTkButton(inner, text=label, anchor="w", height=38, width=420,
+                                fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
+                                font=ctk.CTkFont(size=13),
+                                command=lambda p=prompt: self._use_starter(p))
+            btn.pack(fill="x", pady=3)
+        ctk.CTkLabel(inner, text="Attach an image with 🖼 to ask about screenshots & designs.",
+                     text_color="#555", font=ctk.CTkFont(size=11)).pack(pady=(16, 0))
+
+    def _use_starter(self, prompt):
+        self.user_input.delete("1.0", "end")
+        self.user_input.insert("1.0", prompt)
+        self._refresh_input_hint()
+        self._grow_input()
+        self.user_input.focus_set()
+
+    def _bind_shortcuts(self):
+        self.bind("<Command-n>", lambda _e: (self.new_chat(), "break")[1])
+        self.bind("<Command-t>", lambda _e: (self._add_project_dialog(), "break")[1])
+        self.bind("<Command-s>", lambda _e: (self.save_editor(), "break")[1])
+        self.bind("<Escape>", lambda _e: (self.stop_generation(), "break")[1])
+        for i, name in enumerate(MAIN_TAB_NAMES):
+            self.bind(f"<Command-{i + 1}>",
+                      lambda _e, n=name: (self.main_tabs.set(n), "break")[1])
 
     # ---------------------------------------------------------- tab bar --
     def render_tab_bar(self):
@@ -357,8 +586,8 @@ class MimoIDE(ctk.CTk):
             active = (i == self.active_index)
             run_dot = " ●" if tab.is_generating else ""
             btn = ctk.CTkButton(
-                self.tab_bar_inner, text=f"  {tab.name}{run_dot}  ", height=30,
-                corner_radius=6,
+                self.tab_bar_inner, text=f"  📁 {tab.name}{run_dot}  ", height=30,
+                corner_radius=8,
                 fg_color=GOLD if active else CARD,
                 text_color="#000" if active else TEXT,
                 hover_color="#FFB300" if active else ACTIVE,
@@ -367,10 +596,10 @@ class MimoIDE(ctk.CTk):
             btn.pack(side="left", padx=(0, 4))
             if len(self.tabs) > 1:
                 x = ctk.CTkButton(self.tab_bar_inner, text="×", width=24, height=30,
-                                  corner_radius=6, fg_color=CARD, hover_color="#4A1A1A",
+                                  corner_radius=8, fg_color=CARD, hover_color="#4A1A1A",
                                   text_color=MUTED, font=ctk.CTkFont(size=12),
                                   command=lambda idx=i: self.close_tab(idx))
-                x.pack(side="left", padx=(0, 8))
+                x.pack(side="left", padx=(0, 10))
 
     def add_project_tab(self, path):
         if not path:
@@ -413,25 +642,28 @@ class MimoIDE(ctk.CTk):
             pass
         win = ctk.CTkToplevel(self)
         win.title("Open project")
-        win.geometry("520x440")
+        win.geometry("560x470")
         win.configure(fg_color=BG)
         win.transient(self)
         win.lift()
         win.focus_force()
         ctk.CTkLabel(win, text="Recent projects", text_color=GOLD,
-                     font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=16, pady=(14, 4))
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(anchor="w", padx=18, pady=(16, 6))
         box = ctk.CTkScrollableFrame(win, fg_color=PANEL)
-        box.pack(fill="both", expand=True, padx=12, pady=4)
+        box.pack(fill="both", expand=True, padx=14, pady=4)
         for p in recents:
-            btn = ctk.CTkButton(box, text=p, anchor="w", height=30, fg_color="transparent",
+            btn = ctk.CTkButton(box, text=p, anchor="w", height=34, fg_color="transparent",
                                 hover_color=ACTIVE, text_color=TEXT,
                                 font=ctk.CTkFont(size=12),
                                 command=lambda path=p: (win.destroy(), self.add_project_tab(path)))
             btn.pack(fill="x", padx=4, pady=2)
-        ctk.CTkButton(win, text="📁 Browse…", height=32, fg_color=CARD, hover_color=ACTIVE,
+        if not recents:
+            ctk.CTkLabel(box, text="No recent projects yet", text_color="#666",
+                         font=ctk.CTkFont(size=12)).pack(pady=20)
+        ctk.CTkButton(win, text="📁 Browse…", height=34, fg_color=CARD, hover_color=ACTIVE,
                       text_color=TEXT,
                       command=lambda: (win.destroy(), self._browse_folder())).pack(
-            fill="x", padx=12, pady=(6, 14))
+            fill="x", padx=14, pady=(8, 16))
 
     def _browse_folder(self):
         path = filedialog.askdirectory()
@@ -467,39 +699,38 @@ class MimoIDE(ctk.CTk):
         if not tab:
             return
         self.project_label.configure(text=tab.name.upper()[:26])
-        self.title(f"Mimo-Agentic IDE — {tab.name}")
-        # model
+        self.project_path_label.configure(text=tab.root)
+        self.title(f"Mimo Agentic IDE — {tab.name}")
+        self.chat_ctx_label.configure(text=f"{tab.name}  ·  {tab.root}")
+        self.model_badge.configure(text=tab.model)
         display = self.models_inventory.get(tab.model, tab.model)
         if display in list(self.model_dropdown.cget("values")):
             self.model_dropdown.set(display)
         else:
             self.model_dropdown.configure(values=list(self.models_inventory.values()))
             self.model_dropdown.set(self.models_inventory.get(tab.model, tab.model))
-        # sessions
         self.refresh_sessions(tab, keep_selection=True)
-        # tasks
         self.refresh_tasks_panel()
-        # files
         self._render_files(tab)
-        # editor
         self._restore_editor(tab)
-        # transcript
         self._render_transcript(tab)
-        # terminal
         self._render_terminal(tab)
-        # changes + git (lightweight refresh on switch)
         self.refresh_changes_panel(silent=True)
         self.refresh_git_panel(silent=True)
-        # input state
         self._sync_send_button()
-        self.img_button.configure(fg_color="green" if tab.attached_image else CARD)
+        self._sync_attachment_ui()
+        # keep the live work card in sync with this tab's run state
+        if tab.is_generating:
+            self._work_card_render(tab)
+        else:
+            self.work_card.grid_remove()
 
     # -------------------------------------------------------- chat tags --
     def _setup_chat_tags(self):
         tb = self.chat_display._textbox
-        tb.tag_configure("goal", foreground="#FFE082", background="#3E3300",
+        tb.tag_configure("goal", foreground="#FFE082", background=GOLD_DIM,
                          font=ctk.CTkFont(size=13, weight="bold"),
-                         lmargin1=280, lmargin2=280, rmargin=16, spacing3=8)
+                         lmargin1=260, lmargin2=260, rmargin=16, spacing3=10, spacing1=6)
         tb.tag_configure("assistant", foreground=TEXT, font=ctk.CTkFont(size=13),
                          lmargin1=16, lmargin2=16, rmargin=40, spacing3=8)
         tb.tag_configure("system", foreground=MUTED, font=ctk.CTkFont(size=11),
@@ -519,7 +750,7 @@ class MimoIDE(ctk.CTk):
                          lmargin1=16, spacing1=6, spacing3=3)
         tb.tag_configure("bullet", foreground=TEXT, font=ctk.CTkFont(size=13),
                          lmargin1=40, lmargin2=40, spacing3=2)
-        tb.tag_configure("code", foreground="#D4D4D4", background="#0D0D0D",
+        tb.tag_configure("code", foreground="#D4D4D4", background="#0A0A0A",
                          font=ctk.CTkFont(family="Menlo", size=12),
                          lmargin1=16, lmargin2=16, rmargin=16, spacing1=4, spacing3=4)
         tb.tag_configure("bold", foreground=TEXT, font=ctk.CTkFont(size=13, weight="bold"))
@@ -606,6 +837,7 @@ class MimoIDE(ctk.CTk):
 
     def _render_entry(self, tag, text):
         tb = self.chat_display._textbox
+        self._show_chat()
         self.chat_display.configure(state="normal")
         try:
             if tag == "goal":
@@ -632,12 +864,26 @@ class MimoIDE(ctk.CTk):
         except Exception:
             pass
 
+    def _show_chat(self):
+        try:
+            self.chat_display.tkraise()
+        except Exception:
+            pass
+
+    def _show_welcome(self):
+        try:
+            self.welcome_frame.tkraise()
+        except Exception:
+            pass
+
     def _render_transcript(self, tab):
         self.chat_display.configure(state="normal")
         self.chat_display.delete("1.0", "end")
         self.chat_display.configure(state="disabled")
         for tag, text in tab.transcript[-MAX_TRANSCRIPT:]:
             self._render_entry(tag, text)
+        if not tab.transcript:
+            self._show_welcome()
 
     def append_chat(self, text, tag=None, tab=None):
         tab = tab or self.active_tab()
@@ -677,6 +923,7 @@ class MimoIDE(ctk.CTk):
             if tab.model not in keep:
                 tab.model = next(iter(keep))
             self.model_dropdown.set(keep.get(tab.model, tab.model))
+            self.model_badge.configure(text=tab.model)
 
     def change_model(self, display):
         tab = self.active_tab()
@@ -685,6 +932,7 @@ class MimoIDE(ctk.CTk):
         for key, val in self.models_inventory.items():
             if val == display:
                 tab.model = key
+                self.model_badge.configure(text=key)
                 self.append_chat(f"🧠 Brain for {tab.name}: {display}", tag="system")
                 return
 
@@ -715,10 +963,7 @@ class MimoIDE(ctk.CTk):
         for label, sid in tab.session_labels.items():
             if sid == tab.session_id:
                 current = label
-        if keep_selection:
-            self.sessions_dropdown.set(current or "(new chat)")
-        else:
-            self.sessions_dropdown.set(current or "(new chat)")
+        self.sessions_dropdown.set(current or "(new chat)")
 
     def on_session_selected(self, label):
         tab = self.active_tab()
@@ -749,10 +994,12 @@ class MimoIDE(ctk.CTk):
             w.destroy()
         tasks = tab.tasks_data if tab else []
         done = sum(1 for t in tasks if t.get("status") == "done")
-        self.tasks_label.configure(text=f"Tasks · {done}/{len(tasks)} done" if tasks else "Tasks")
+        self.tasks_label.configure(
+            text=f"◈ Tasks · {done}/{len(tasks)}" if tasks else "◈ Tasks")
         if not tasks:
-            ctk.CTkLabel(self.tasks_container, text="No tasks yet", text_color="#6A6A6A",
-                         font=ctk.CTkFont(size=12)).pack(anchor="w", padx=8, pady=6)
+            ctk.CTkLabel(self.tasks_container, text="No tasks yet — the agent\ncreates these during a run",
+                         text_color="#555", font=ctk.CTkFont(size=11), justify="left"
+                         ).pack(anchor="w", padx=8, pady=8)
             return
         colors = {"done": GREEN, "in_progress": GOLD, "pending": MUTED}
         marks = {"done": "☑", "in_progress": "◐", "pending": "☐"}
@@ -760,7 +1007,7 @@ class MimoIDE(ctk.CTk):
             status = str(t.get("status") or "pending")
             row = ctk.CTkLabel(self.tasks_container,
                                text=f"{marks.get(status, '☐')} {t.get('title', '')}",
-                               anchor="w", justify="left", wraplength=200,
+                               anchor="w", justify="left", wraplength=210,
                                text_color=colors.get(status, MUTED),
                                font=ctk.CTkFont(size=12,
                                                 weight="bold" if status == "in_progress" else "normal"))
@@ -800,7 +1047,7 @@ class MimoIDE(ctk.CTk):
             w.destroy()
         tasks = (self.active_tab().tasks_data if self.active_tab() else [])
         if not tasks:
-            ctk.CTkLabel(box, text="No tasks yet", text_color="#6A6A6A",
+            ctk.CTkLabel(box, text="No tasks yet", text_color="#666",
                          font=ctk.CTkFont(size=13)).pack(pady=20)
             return
         colors = {"done": GREEN, "in_progress": GOLD, "pending": TEXT}
@@ -848,8 +1095,6 @@ class MimoIDE(ctk.CTk):
         self.refresh_tasks_panel()
         self._render_transcript(tab)
         self.sessions_dropdown.set("(new chat)")
-        self.append_chat(f"🆕 New chat for {tab.name} (old chats saved — pick any to resume).",
-                         tag="system")
 
     # -------------------------------------------------------- files/editor --
     def _scan_files(self, tab):
@@ -864,11 +1109,22 @@ class MimoIDE(ctk.CTk):
         tab.files = sorted(found)
         return tab.files
 
+    def _on_files_filter(self, _event=None):
+        tab = self.active_tab()
+        if tab:
+            self._render_files(tab)
+
     def _render_files(self, tab):
         for w in self.files_container.winfo_children():
             w.destroy()
         self._scan_files(tab)
-        for rel in tab.files:
+        q = self.files_filter.get().strip().lower()
+        shown = [rel for rel in tab.files if q in rel.lower()] if q else tab.files
+        if not shown:
+            ctk.CTkLabel(self.files_container, text="No files match" if q else "No files",
+                         text_color="#555", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=8)
+            return
+        for rel in shown[:400]:
             btn = ctk.CTkButton(self.files_container, text=rel, anchor="w", height=24,
                                 fg_color="transparent", hover_color=ACTIVE, text_color=TEXT,
                                 font=ctk.CTkFont(family="Menlo", size=11),
@@ -887,7 +1143,30 @@ class MimoIDE(ctk.CTk):
     def _restore_editor(self, tab):
         self.editor_box.delete("1.0", "end")
         self.editor_box.insert("1.0", tab.editor_text or "")
-        self.editor_path_label.configure(text=tab.editor_path or "No file open")
+        tab.editor_dirty = False
+        self._update_editor_status(tab)
+
+    def _update_editor_status(self, tab):
+        if not tab.editor_path:
+            self.editor_path_label.configure(text="No file open", text_color=MUTED)
+            self.editor_save_btn.configure(fg_color=CARD, text_color=TEXT)
+            return
+        mark = "  ● unsaved" if tab.editor_dirty else ""
+        self.editor_path_label.configure(text=f"{tab.editor_path}{mark}",
+                                         text_color=GOLD if tab.editor_dirty else MUTED)
+        self.editor_save_btn.configure(fg_color=GOLD if tab.editor_dirty else CARD,
+                                       text_color="#000" if tab.editor_dirty else TEXT)
+
+    def _mark_editor_dirty(self, _event=None):
+        tab = self.active_tab()
+        if not tab or not tab.editor_path:
+            return
+        try:
+            current = self.editor_box.get("1.0", "end-1c")
+        except Exception:
+            return
+        tab.editor_dirty = current != tab.editor_text
+        self._update_editor_status(tab)
 
     def open_file(self, rel):
         tab = self.active_tab()
@@ -921,6 +1200,8 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"❌ Save failed: {e}", tag="error")
             return
         tab.editor_text = content
+        tab.editor_dirty = False
+        self._update_editor_status(tab)
         self.append_chat(f"💾 Saved {tab.editor_path}", tag="success")
         self._render_files(tab)
 
@@ -950,13 +1231,23 @@ class MimoIDE(ctk.CTk):
         except Exception:
             pass
 
+    def _clear_terminal(self):
+        tab = self.active_tab()
+        if tab:
+            tab.raw_log.clear()
+        self.terminal_box.configure(state="normal")
+        self.terminal_box.delete("1.0", "end")
+        self.terminal_box.configure(state="disabled")
+
     def _render_terminal(self, tab):
         self.terminal_box.configure(state="normal")
         self.terminal_box.delete("1.0", "end")
         if tab.raw_log:
             self.terminal_box.insert("1.0", "\n".join(tab.raw_log[-3000:]) + "\n")
         else:
-            self.terminal_box.insert("1.0", "— terminal idle · raw agent output streams here —\n")
+            self.terminal_box.insert(
+                "1.0", "— terminal idle —\nraw agent output (plans, tool calls, command results)\n"
+                       "streams here while a run is active.\n")
         self.terminal_box.configure(state="disabled")
         try:
             self.terminal_box.see("end")
@@ -980,9 +1271,9 @@ class MimoIDE(ctk.CTk):
             w.destroy()
         code, out = self._git(tab, "status", "--porcelain")
         if code != 0:
-            self.changes_title.configure(text="Recent changes · not a git repo")
-            lbl = ctk.CTkLabel(self.changes_list, text="Run 'Initialize' in Git tab\nto track changes",
-                               text_color="#6A6A6A", font=ctk.CTkFont(size=12),
+            self.changes_title.configure(text="Working tree · not a git repo")
+            lbl = ctk.CTkLabel(self.changes_list, text="Run 'Initialize' in the Git tab\nto track changes",
+                               text_color="#555", font=ctk.CTkFont(size=12),
                                justify="left")
             lbl.pack(anchor="w", padx=8, pady=8)
             tab.changed_files = {}
@@ -990,15 +1281,16 @@ class MimoIDE(ctk.CTk):
             return
         entries = [l for l in out.splitlines() if l.strip()]
         self.changes_title.configure(
-            text=f"Recent changes · {len(entries)} file{'s' if len(entries) != 1 else ''}")
+            text=f"Working tree · {len(entries)} file{'s' if len(entries) != 1 else ''}"
+                 if entries else "Working tree · clean")
         tab.changed_files = {}
         if not entries:
-            lbl = ctk.CTkLabel(self.changes_list, text="Working tree clean ✓",
+            lbl = ctk.CTkLabel(self.changes_list, text="✓ Working tree clean",
                                text_color=GREEN, font=ctk.CTkFont(size=12))
             lbl.pack(anchor="w", padx=8, pady=8)
             self._show_diff(None, "")
             return
-        status_colors = {"M": GOLD, "A": GREEN, "D": RED, "??": "#64B5F6", "R": GREEN}
+        status_colors = {"M": GOLD, "A": GREEN, "D": RED, "??": BLUE, "R": GREEN}
         for e in entries:
             st, path = e[:2], e[3:].strip()
             if " -> " in path:
@@ -1133,7 +1425,25 @@ class MimoIDE(ctk.CTk):
             if tab:
                 tab.attached_image = path
             self.append_chat(f"🖼️ Image attached: {os.path.basename(path)}", tag="system")
-            self.img_button.configure(fg_color="green")
+            self._sync_attachment_ui()
+
+    def _sync_attachment_ui(self):
+        tab = self.active_tab()
+        attached = bool(tab and tab.attached_image)
+        if attached:
+            name = os.path.basename(tab.attached_image)
+            self.chip_label.configure(text=f"🖼  {name}")
+            self.chip_frame.grid()
+            self.img_button.configure(fg_color=GOLD, text_color="#000")
+        else:
+            self.chip_frame.grid_remove()
+            self.img_button.configure(fg_color=CARD, text_color=TEXT)
+
+    def _clear_attachment(self):
+        tab = self.active_tab()
+        if tab:
+            tab.attached_image = None
+        self._sync_attachment_ui()
 
     def image_to_base64(self, path):
         with open(path, "rb") as f:
@@ -1156,12 +1466,126 @@ class MimoIDE(ctk.CTk):
         except Exception as e:
             return f"Error describing image: {e}"
 
+    # -------------------------------------------------------- input --
+    def _on_input_return(self, _event):
+        self.send_request()
+        return "break"
+
+    def _on_input_shift_return(self, _event):
+        return None
+
+    def _on_input_keyrelease(self, _event):
+        if _event.keysym in ("Shift_L", "Shift_R", "Command_L", "Command_R",
+                             "Control_L", "Control_R", "Alt_L", "Alt_R", "Meta_L", "Meta_R"):
+            return
+        self._refresh_input_hint()
+        self._grow_input()
+
+    def _on_input_focus_in(self, _event):
+        self.input_hint.place_forget()
+
+    def _on_input_focus_out(self, _event):
+        self._refresh_input_hint()
+
+    def _refresh_input_hint(self):
+        text = self.user_input.get("1.0", "end-1c").strip()
+        if text or self.focus_get() == str(self.user_input):
+            self.input_hint.place_forget()
+        else:
+            self.input_hint.place(relx=0, rely=0.5, anchor="w", x=14)
+
+    def _grow_input(self):
+        content = self.user_input.get("1.0", "end-1c")
+        lines = content.count("\n") + 1 if content else 1
+        lines = min(lines, 8)
+        h = max(52, lines * 20 + 20)
+        self.user_input.configure(height=h)
+
+    # -------------------------------------------------------- work card --
+    _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _WORK_PHASE_RE = re.compile(r"^[✦◆]\s*(.*)$")
+    _WORK_STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
+
+    def _route_to_work_card(self, line, tab):
+        """Send phase markers and step lines to the work card instead of chat."""
+        m = self._WORK_PHASE_RE.match(line)
+        if m:
+            body = re.sub(r"\[\d+/\d+\]\s*", "", m.group(1)).strip()
+            for key, label in self._PHASE_KEYWORDS:
+                if key in body:
+                    self._work_card_update(tab, phase=label)
+                    return True
+            self._work_card_update(tab, phase=body or "Working…")
+            return True
+        m = self._WORK_STEP_RE.match(line)
+        if m:
+            step = f"step {m.group(1)}/{m.group(2)}"
+            action = m.group(3).strip()
+            self._work_card_update(tab, step=step, action=action)
+            return True
+        return False
+
+    def _show_work_card(self, tab):
+        tab.cur_phase = "Starting…"
+        tab.cur_step = ""
+        tab.cur_action = ""
+        if tab is self.active_tab():
+            self.after(0, self._work_card_render, tab)
+
+    def _hide_work_card(self, tab):
+        tab.cur_phase = ""
+        tab.cur_step = ""
+        tab.cur_action = ""
+        if tab is self.active_tab():
+            self.after(0, self.work_card.grid_remove)
+
+    def _work_card_update(self, tab, phase=None, step=None, action=None):
+        if phase is not None:
+            tab.cur_phase = phase
+        if step is not None:
+            tab.cur_step = step
+        if action is not None:
+            tab.cur_action = action
+        if tab is self.active_tab():
+            self.after(0, self._work_card_render, tab)
+
+    def _work_card_render(self, tab):
+        if not tab.is_generating:
+            self.work_card.grid_remove()
+            return
+        self.work_card.grid()
+        self.work_phase_lbl.configure(text=tab.cur_phase or "Working…")
+        elapsed = int(time.time() - tab.run_started) if tab.run_started else 0
+        meta = f"{tab.model}  ·  {elapsed}s"
+        if tab.cur_step:
+            meta = f"{tab.cur_step}  ·  {meta}"
+        self.work_meta_lbl.configure(text=meta)
+        self.work_action_lbl.configure(text=tab.cur_action or "")
+        if not hasattr(self, "_spin_pos"):
+            self._spin_pos = 0
+        self._spin_pos = (self._spin_pos + 1) % len(self._SPIN_FRAMES)
+        self.work_spin.configure(text=self._SPIN_FRAMES[self._spin_pos])
+        self.after(120, self._work_card_anim, tab)
+
+    def _work_card_anim(self, tab):
+        if tab.is_generating and tab is self.active_tab() and self.work_card.winfo_ismapped():
+            self._spin_pos = (getattr(self, "_spin_pos", 0) + 1) % len(self._SPIN_FRAMES)
+            self.work_spin.configure(text=self._SPIN_FRAMES[self._spin_pos])
+            elapsed = int(time.time() - tab.run_started) if tab.run_started else 0
+            meta = f"{tab.model}  ·  {elapsed}s"
+            if tab.cur_step:
+                meta = f"{tab.cur_step}  ·  {meta}"
+            self.work_meta_lbl.configure(text=meta)
+            self.after(120, self._work_card_anim, tab)
+
     # -------------------------------------------------------- send/stop --
     def send_request(self):
-        task = self.user_input.get()
-        if not task.strip():
+        task = self.user_input.get("1.0", "end-1c").strip()
+        if not task:
             return
-        self.user_input.delete(0, "end")
+        self.user_input.delete("1.0", "end")
+        self._refresh_input_hint()
+        self.user_input.configure(height=52)
         tab = self.active_tab()
         if not tab:
             return
@@ -1175,6 +1599,8 @@ class MimoIDE(ctk.CTk):
         self.append_chat(task, tag="goal", tab=tab)
         tab.is_generating = True
         tab.stop_requested = False
+        tab.run_started = time.time()
+        self._show_work_card(tab)
         self._sync_send_button()
         self.render_tab_bar()
         threading.Thread(target=self.agent_loop, args=(tab, task), daemon=True).start()
@@ -1182,10 +1608,10 @@ class MimoIDE(ctk.CTk):
     def _sync_send_button(self):
         tab = self.active_tab()
         if tab and tab.is_generating:
-            self.send_button.configure(text="■ Stop", fg_color=RED, hover_color="#D32F2F",
+            self.send_button.configure(text="■  Stop", fg_color=RED, hover_color="#D32F2F",
                                        text_color="#FFF", command=self.stop_generation)
         else:
-            self.send_button.configure(text="▶ Run", fg_color=GOLD, text_color="#000",
+            self.send_button.configure(text="▶  Run", fg_color=GOLD, text_color="#000",
                                        hover_color="#FFB300", command=self.send_request)
 
     def stop_generation(self):
@@ -1246,7 +1672,7 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"🖼️ {visual_context}", tag="observation", tab=tab)
             tab.attached_image = None
             if tab is self.active_tab():
-                self.after(0, lambda: self.img_button.configure(fg_color=CARD))
+                self.after(0, self._sync_attachment_ui)
 
         full_goal = goal
         if visual_context:
@@ -1287,6 +1713,9 @@ class MimoIDE(ctk.CTk):
                     display = self._handle_tasks_line(line, tab)
                     if display:
                         self.append_chat(display, tag="activity", tab=tab)
+                    continue
+                # presentation: phase + step lines drive the work card, not the chat
+                if self._route_to_work_card(line, tab):
                     continue
                 tag, text = self._classify_engine_line(line)
                 self.append_chat(text, tag=tag, tab=tab)
@@ -1338,6 +1767,8 @@ class MimoIDE(ctk.CTk):
     def _finish_tab_run(self, tab):
         tab.is_generating = False
         tab.stop_requested = False
+        tab.run_started = 0.0
+        self._hide_work_card(tab)
         if tab is self.active_tab():
             self.after(0, self._sync_send_button)
         self.after(0, self.render_tab_bar)
@@ -1347,17 +1778,24 @@ class MimoIDE(ctk.CTk):
         tab = self.active_tab()
         if tab:
             if tab.is_generating:
+                elapsed = int(time.time() - tab.run_started) if tab.run_started else 0
                 queue = f" · queue {len(tab.pending_tasks)}" if tab.pending_tasks else ""
-                self.status_bar.configure(text=f"● running · {tab.name} · {tab.model}{queue}",
-                                          text_color=GOLD)
+                dots = "." * (int(time.time() * 2) % 4)
+                self.status_bar.configure(
+                    text=f"● Running{dots} · {tab.name} · {tab.model} · {elapsed}s{queue}",
+                    text_color=GOLD)
             else:
-                self.status_bar.configure(text=f"○ idle · {tab.name} · {tab.model}",
-                                          text_color=MUTED)
-        self.after(1500, self._status_tick)
+                n_sess = len(tab.session_labels)
+                self.status_bar.configure(
+                    text=f"○ idle · {tab.name} · {tab.model}"
+                         + (f" · {n_sess} session{'s' if n_sess != 1 else ''}" if n_sess else ""),
+                    text_color=MUTED)
+        self.after(900, self._status_tick)
 
     def _on_close(self):
         for tab in self.tabs:
             self._stop_tab(tab, silent=True)
+        _save_geometry(self)
         self.destroy()
 
 

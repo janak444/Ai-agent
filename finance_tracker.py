@@ -1,1 +1,88 @@
- "import json\nimport os\n\nclass Transaction:\n    def __init__(self, amount, category, description):\n        self.amount = amount\n        self.category = category\n        self.description = description\n\nclass FinanceTracker:\n    def __init__(self, filename='finance.json'):\n        self.filename = filename\n        self.transactions = self.load_transactions()\n\n    def add_transaction(self, amount, category, description):\n        self.transactions.append(Transaction(amount, category, description))\n        self.save_transactions()\n\n    def add_income(self, amount, category, description):\n        self.add_transaction(amount, category, description)\n\n    def add_expense(self, amount, category, description):\n        self.add_transaction(-amount, category, description)\n\n    def categorize(self, category):\n        return [t for t in self.transactions if t.category == category]\n\n    def generate_summary(self):\n        total_balance = sum(t.amount for t in self.transactions)\n        spending_per_category = {}\n        \n        # Group transactions by category and sum amounts\n        for transaction in self.transactions:\n            if transaction.category in spending_per_category:\n                spending_per_category[transaction.category] += transaction.amount\n            else:\n                spending_per_category[transaction.category] = transaction.amount\n        \n        return total_balance, spending_per_category\n\n    def save_transactions(self):\n        with open(self.filename, 'w') as f:\n            json.dump([t.__dict__ for t in self.transactions], f)\n\n    def load_transactions(self):\n        if os.path.exists(self.filename):\n            with open(self.filename, 'r') as f:\n                return [Transaction(**t) for t in json.load(f)]\n        else:\n            return []\n\ndef main():\n    tracker = FinanceTracker()\n\n    while True:\n        print(\"1. Add transaction\")\n        print(\"2. Add income\")\n        print(\"3. Add expense\")\n        print(\"4. Generate summary\")\n        print(\"5. Quit\")\n\n        choice = input(\"Choose an option: \")\n\n        if choice == '1':\n            amount = float(input(\"Enter amount: \"))\n            category = input(\"Enter category: \")\n            description = input(\"Enter description: \")\n            tracker.add_transaction(amount, category, description)\n        elif choice == '2':\n            amount = float(input(\"Enter amount: \"))\n            category = input(\"Enter category: \")\n            description = input(\"Enter description: \")\n            tracker.add_income(amount, category, description)\n        elif choice == '3':\n            amount = float(input(\"Enter amount: \"))\n            category = input(\"Enter category: \")\n            description = input(\"Enter description: \")\n            tracker.add_expense(amount, category, description)\n        elif choice == '4':\n            total_balance, spending_per_category = tracker.generate_summary()\n            print(f\"Total balance: {total_balance}\")\n            for category, amount in spending_per_category.items():\n                print(f\"{category}: {amount}\")\n        elif choice == '5':\n            break\n        else:\n            print(\"Invalid choice\")\n\nif __name__ == \"__main__\":\n    main()
+import json
+import os
+
+class Transaction:
+    def __init__(self, amount, category, description):
+        self.amount = amount
+        self.category = category
+        self.description = description
+
+class FinanceTracker:
+    def __init__(self, filename='finance.json'):
+        self.filename = filename
+        self.transactions = self.load_transactions()
+
+    def add_transaction(self, amount, category, description):
+        self.transactions.append(Transaction(amount, category, description))
+        self.save_transactions()
+
+    def add_income(self, amount, category, description):
+        self.transactions.append(Transaction(amount, category, description))
+        self.save_transactions()
+
+    def add_expense(self, amount, category, description):
+        self.transactions.append(Transaction(-amount, category, description))
+        self.save_transactions()
+
+    def categorize(self, category):
+        return [t for t in self.transactions if t.category == category]
+
+    def generate_summary(self):
+        total_balance = sum(t.amount for t in self.transactions)
+        spending_per_category = {}
+        for t in self.transactions:
+            category = t.category
+            if category in spending_per_category:
+                spending_per_category[category] += abs(t.amount)
+            else:
+                spending_per_category[category] = abs(t.amount)
+        return total_balance, spending_per_category
+
+    def save_transactions(self):
+        with open(self.filename, 'w') as f:
+            json.dump(self.transactions, f)
+
+    def load_transactions(self):
+        if os.path.exists(self.filename):
+            with open(self.filename, 'r') as f:
+                return json.load(f)
+        else:
+            return []
+
+def main():
+    tracker = FinanceTracker()
+
+    while True:
+        print("1. Add transaction")
+        print("2. Add income")
+        print("3. Add expense")
+        print("4. Generate summary")
+        print("5. Quit")
+        choice = input("Choose an option: ")
+        if choice == '1':
+            amount = float(input("Enter amount: "))
+            category = input("Enter category: ")
+            description = input("Enter description: ")
+            tracker.add_transaction(amount, category, description)
+        elif choice == '2':
+            amount = float(input("Enter amount: "))
+            category = input("Enter category: ")
+            description = input("Enter description: ")
+            tracker.add_income(amount, category, description)
+        elif choice == '3':
+            amount = float(input("Enter amount: "))
+            category = input("Enter category: ")
+            description = input("Enter description: ")
+            tracker.add_expense(amount, category, description)
+        elif choice == '4':
+            total_balance, spending_per_category = tracker.generate_summary()
+            print(f"Total balance: {total_balance}")
+            for category, amount in spending_per_category.items():
+                print(f"{category}: {amount}")
+        elif choice == '5':
+            break
+        else:
+            print("Invalid choice. Please choose a valid option.")
+
+if __name__ == "__main__":
+    main()
