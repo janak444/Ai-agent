@@ -7,8 +7,12 @@ import time
 import threading
 import subprocess
 import base64
+import bisect
+import difflib
+import hashlib
 
 import customtkinter as ctk
+import tkinter as tk
 from tkinter import filedialog
 import httpx2
 
@@ -134,7 +138,9 @@ def _detect_ram_gb():
 
 
 def _project_prefs_path(root):
-    h = abs(hash(os.path.abspath(root))) % (10 ** 8)
+    # stable digest — plain hash() is randomized per process, which silently
+    # broke prefs persistence across restarts (session_id, model)
+    h = hashlib.sha256(os.path.abspath(root).encode("utf-8", "replace")).hexdigest()[:16]
     return os.path.expanduser(f"~/.mimo_ide_proj_{h}.json")
 
 
@@ -152,6 +158,22 @@ def _save_project_prefs(root, prefs):
             json.dump(prefs, f, indent=2)
     except OSError:
         pass
+
+
+def _parse_event(line):
+    """Parse one JSONL event line emitted by the engine (--events mode).
+    Returns the event dict, or None when the line is not an event — so legacy
+    human-readable output keeps flowing through the old classifier.
+    """
+    if not line or line[0] != "{":
+        return None
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return None
+    if isinstance(obj, dict) and isinstance(obj.get("evt"), str):
+        return obj
+    return None
 
 
 class Tooltip:
@@ -220,9 +242,11 @@ class ProjectTab:
         self.pending_tasks = []
         self.attached_image = None
         self.editor_path = None
-        self.editor_text = ""
+        self.editor_text = ""          # content on disk / last saved
+        self.editor_buf = None          # live editor buffer (unsaved edits)
         self.editor_widget = None
         self.editor_dirty = False
+        self.inline_preview = None      # ⌘K before-snapshot for diff review
         self.raw_log = []
         self.changed_files = {}
         self.git_root = None
@@ -233,6 +257,17 @@ class ProjectTab:
         self.cur_phase = ""
         self.cur_step = ""
         self.cur_action = ""
+        self.last_prompt_tokens = 0
+        self.last_gen_tokens = 0
+        self.total_prompt_tokens = 0
+        self.total_gen_tokens = 0
+        self.context_files = []
+        # live assistant streaming (JSONL delta events from the engine)
+        self.stream_buf = None
+        self.stream_idx = None
+        self.stream_anchor = None
+        self.stream_pending = False
+        self.render_seq = 0
 
 
 # --------------------------------------------------------------------- app --
@@ -396,6 +431,12 @@ class MimoIDE(ctk.CTk):
                                          font=ctk.CTkFont(size=11),
                                          command=self._add_project_dialog)
         self.project_btn.grid(row=0, column=1, padx=(6, 0))
+        self.search_btn = ctk.CTkButton(files_hdr, text="⌕", width=30, height=22,
+                                        fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
+                                        font=ctk.CTkFont(size=13, weight="bold"),
+                                        command=self._open_search_panel)
+        self.search_btn.grid(row=0, column=2, padx=(6, 0))
+        Tooltip(self.search_btn, "Search in project  (⌘⇧F)")
         self.files_filter = ctk.CTkEntry(self.sidebar, height=28, fg_color=CARD,
                                          placeholder_text="Filter files…",
                                          placeholder_text_color="#666", border_color=ACTIVE,
@@ -419,6 +460,7 @@ class MimoIDE(ctk.CTk):
         self.chat_tab = self.main_tabs.add("Chat")
         self.editor_tab = self.main_tabs.add("Editor")
         self.terminal_tab = self.main_tabs.add("Terminal")
+        self.shell_tab = self.main_tabs.add("Shell")
         self.changes_tab = self.main_tabs.add("Changes")
         self.git_tab = self.main_tabs.add("Git")
 
@@ -485,9 +527,9 @@ class MimoIDE(ctk.CTk):
                                          wrap="none")
         self.editor_box.grid(row=0, column=1, sticky="nsew")
         self.editor_box.bind("<KeyRelease>", self._on_editor_changed, add="+")
-        self.editor_box.bind("<MouseWheel>", self._sync_gutter_scroll, add="+")
-        self.editor_box.bind("<Button-4>", self._sync_gutter_scroll, add="+")
-        self.editor_box.bind("<Button-5>", self._sync_gutter_scroll, add="+")
+        self.editor_box.bind("<MouseWheel>", self._on_editor_scroll, add="+")
+        self.editor_box.bind("<Button-4>", self._on_editor_scroll, add="+")
+        self.editor_box.bind("<Button-5>", self._on_editor_scroll, add="+")
         self.editor_box._textbox.configure(tabs=())
         self._setup_editor_tags()
 
@@ -529,6 +571,24 @@ class MimoIDE(ctk.CTk):
         self.goto_entry.bind("<Return>", lambda _e: self.goto_line())
         self.goto_bar.grid_remove()
 
+        # inline edit bar (⌘K) — select code, ask for a change
+        self.inline_bar = ctk.CTkFrame(self.editor_tab, fg_color=CARD, corner_radius=8)
+        self.inline_bar.grid(row=4, column=0, sticky="ew", pady=(4, 0))
+        self.inline_bar.grid_columnconfigure(1, weight=1)
+        self.inline_bar.grid_remove()
+        ctk.CTkLabel(self.inline_bar, text="⌘K", text_color=GOLD,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(10, 6), pady=6)
+        self.inline_entry = ctk.CTkEntry(self.inline_bar, height=28, fg_color=BG,
+                                         border_color=ACTIVE, text_color=TEXT,
+                                         placeholder_text="Describe the change for the selected code…")
+        self.inline_entry.grid(row=0, column=1, sticky="ew", pady=6)
+        self.inline_entry.bind("<Return>", lambda _e: self._send_inline_edit())
+        self.inline_entry.bind("<Escape>", lambda _e: self._hide_inline_bar())
+        ctk.CTkButton(self.inline_bar, text="Run", width=60, height=26, fg_color=GOLD,
+                      text_color="#000", command=self._send_inline_edit).grid(row=0, column=2, padx=(8, 10))
+        ctk.CTkButton(self.inline_bar, text="✕", width=30, height=26, fg_color="#4A1A1A",
+                      text_color=RED, command=self._hide_inline_bar).grid(row=0, column=3, padx=(0, 10))
+
         # Terminal tab
         self.terminal_tab.grid_columnconfigure(0, weight=1)
         self.terminal_tab.grid_rowconfigure(1, weight=1)
@@ -552,6 +612,35 @@ class MimoIDE(ctk.CTk):
                                            wrap="char")
         self.terminal_box.grid(row=1, column=0, sticky="nsew")
         self.terminal_box.configure(state="disabled")
+
+        # Shell tab — interactive pty terminal
+        self.shell_tab.grid_columnconfigure(0, weight=1)
+        self.shell_tab.grid_rowconfigure(1, weight=1)
+        sbar = ctk.CTkFrame(self.shell_tab, fg_color="transparent")
+        sbar.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        sbar.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(sbar, text="Interactive shell", text_color=MUTED,
+                     font=ctk.CTkFont(size=11)).grid(row=0, column=0, sticky="w")
+        self.shell_start_btn = ctk.CTkButton(sbar, text="⏵ Start", width=80, height=26,
+                                             fg_color=CARD, hover_color=ACTIVE,
+                                             text_color=TEXT, command=self._shell_start)
+        self.shell_start_btn.grid(row=0, column=1, padx=(8, 0))
+        self.shell_kill_btn = ctk.CTkButton(sbar, text="⏹ Kill", width=70, height=26,
+                                            fg_color="#4A1A1A", hover_color=RED,
+                                            text_color=RED, command=self._shell_kill)
+        self.shell_kill_btn.grid(row=0, column=2, padx=(6, 0))
+        self.shell_clear_btn = ctk.CTkButton(sbar, text="Clear", width=70, height=26,
+                                             fg_color=CARD, hover_color=ACTIVE,
+                                             text_color=TEXT, command=self._shell_clear)
+        self.shell_clear_btn.grid(row=0, column=3, padx=(6, 0))
+        self.shell_box = ctk.CTkTextbox(self.shell_tab, fg_color="#0A0A0A",
+                                        text_color="#B8B8B8",
+                                        font=ctk.CTkFont(family="Menlo", size=12),
+                                        wrap="char")
+        self.shell_box.grid(row=1, column=0, sticky="nsew")
+        self.shell_box.bind("<KeyRelease>", self._on_shell_key)
+        self.shell_proc = None
+        self.shell_buf = ""
 
         # Changes tab
         self.changes_tab.grid_columnconfigure(0, weight=1)
@@ -597,13 +686,23 @@ class MimoIDE(ctk.CTk):
         self.git_refresh_btn.grid(row=0, column=2, padx=(6, 0))
         git_actions = ctk.CTkFrame(self.git_tab, fg_color="transparent")
         git_actions.grid(row=1, column=0, sticky="ew", pady=(0, 6))
-        for text, cmd, tip in [("Commit all", self.git_commit_all, "git add -A && git commit"),
+        for text, cmd, tip in [("Stage all", self.git_stage_all, "git add -A"),
+                               ("Commit all", self.git_commit_all, "git add -A && git commit"),
                                ("Pull", self.git_pull, "git pull"),
                                ("Push", self.git_push, "git push")]:
-            b = ctk.CTkButton(git_actions, text=text, width=110, height=30,
+            b = ctk.CTkButton(git_actions, text=text, width=100, height=30,
                               fg_color=CARD, hover_color=ACTIVE, text_color=TEXT, command=cmd)
             b.pack(side="left", padx=(0, 6))
             Tooltip(b, tip)
+        self.git_branch_var = ctk.StringVar(value="")
+        self.git_branch_menu = ctk.CTkOptionMenu(git_actions, values=["(branch)"],
+                                                 variable=self.git_branch_var,
+                                                 command=self._on_branch_select,
+                                                 fg_color=ACTIVE, button_color=GOLD,
+                                                 button_hover_color="#FFB300",
+                                                 text_color=TEXT, dropdown_fg_color=CARD,
+                                                 dropdown_text_color=TEXT, height=30, width=140)
+        self.git_branch_menu.pack(side="right", padx=(6, 0))
         self.git_commit_msg = ctk.CTkEntry(git_actions, height=30, fg_color=CARD,
                                            placeholder_text="Commit message…",
                                            placeholder_text_color=MUTED, border_color=ACTIVE,
@@ -709,7 +808,7 @@ class MimoIDE(ctk.CTk):
                                        font=ctk.CTkFont(size=11), padx=14)
         self.status_bar.grid(row=0, column=0, sticky="ew")
         self.shortcut_hint = ctk.CTkLabel(status_wrap,
-                                          text="⌘⏎ send · ⌘N new chat · ⌘T new tab · ⌘1-5 panels · esc stop",
+                                          text="⌘⏎ send · ⌘K inline edit · ⌘F find · ⌘P files · ⌘N new · esc stop",
                                           height=26, anchor="e", fg_color="transparent",
                                           text_color="#555", font=ctk.CTkFont(size=10), padx=14)
         self.shortcut_hint.grid(row=0, column=1, sticky="e")
@@ -752,6 +851,9 @@ class MimoIDE(ctk.CTk):
         self.bind("<Command-f>", lambda _e: (self.toggle_find_bar(), "break")[1])
         self.bind("<Command-g>", lambda _e: (self.toggle_goto_bar(), "break")[1])
         self.bind("<Command-p>", lambda _e: (self._open_fuzzy_finder(), "break")[1])
+        self.bind("<Command-k>", lambda _e: (self.toggle_inline_bar(), "break")[1])
+        self.bind("<Command-Shift-f>", lambda _e: (self._open_search_panel(), "break")[1])
+        self.bind("<Command-Shift-F>", lambda _e: (self._open_search_panel(), "break")[1])
         for i, name in enumerate(MAIN_TAB_NAMES):
             self.bind(f"<Command-{i + 1}>",
                       lambda _e, n=name: (self.main_tabs.set(n), "break")[1])
@@ -800,6 +902,15 @@ class MimoIDE(ctk.CTk):
         self.refresh_sessions(tab)
         self.render_tab_bar()
         self._remember_project(path)
+        # restore the saved chat + tasks for the persisted session (restart-proof)
+        if tab.session_id:
+            sess_path = os.path.join(tab.root, ".agent_sessions", f"{tab.session_id}.json")
+            if os.path.isfile(sess_path):
+                self._load_session_tasks(tab, tab.session_id)
+                self._load_session_transcript(tab, tab.session_id)
+            else:
+                tab.session_id = None
+                _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
 
     def _remember_project(self, path):
         recents = []
@@ -903,6 +1014,155 @@ class MimoIDE(ctk.CTk):
 
         entry.bind("<KeyRelease>", on_key)
         render()
+        entry.focus_set()
+
+    # ---------------------------------------------------------- search --
+    @staticmethod
+    def _project_search(root, query, limit=200):
+        """Project-wide content search → [(relpath, lineno, text), ...].
+        Uses ripgrep when available (fast, respects .gitignore); falls back to
+        a Python scan so search works everywhere.
+        """
+        if not query:
+            return [], ""
+        rg = shutil.which("rg")
+        if rg:
+            try:
+                r = subprocess.run(
+                    [rg, "-i", "-F", "--no-heading", "--line-number", "--color", "never",
+                     "--max-count", "50", "--max-filesize", "2M", "--", query, root],
+                    capture_output=True, text=True, timeout=20, errors="replace")
+            except (OSError, subprocess.TimeoutExpired):
+                r = None
+            if r is not None and r.returncode in (0, 1):
+                hits = []
+                for ln in r.stdout.splitlines():
+                    if not ln.strip():
+                        continue
+                    try:
+                        fp, no, body = ln.split(":", 2)
+                        rel = os.path.relpath(fp, root)
+                        hits.append((rel, int(no), body.strip()[:220]))
+                    except ValueError:
+                        continue
+                    if len(hits) >= limit:
+                        break
+                return hits, "rg"
+        hits = []
+        q = query.lower()
+        for dirpath, dirs, files in os.walk(root):
+            dirs[:] = [d for d in dirs if d not in PROJECT_SKIP_DIRS]
+            for name in files:
+                fp = os.path.join(dirpath, name)
+                try:
+                    if os.path.getsize(fp) > 1_000_000:
+                        continue
+                    with open(fp, encoding="utf-8", errors="ignore") as f:
+                        for i, line in enumerate(f, 1):
+                            if q in line.lower():
+                                hits.append((os.path.relpath(fp, root), i, line.strip()[:220]))
+                                if len(hits) >= limit:
+                                    return hits, "python"
+                except OSError:
+                    continue
+        return hits, "python"
+
+    def _open_search_panel(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        if getattr(self, "_search_win", None) is not None:
+            try:
+                self._search_win.destroy()
+            except Exception:
+                pass
+        win = ctk.CTkToplevel(self)
+        self._search_win = win
+        win.title("Search project")
+        win.geometry("760x540")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+        entry = ctk.CTkEntry(win, height=36, fg_color=CARD, border_color=GOLD,
+                             text_color=TEXT, placeholder_text="Search in all files…  (ripgrep)",
+                             font=ctk.CTkFont(size=14))
+        entry.pack(fill="x", padx=14, pady=(14, 6))
+        status = ctk.CTkLabel(win, text="Type to search the project", text_color=MUTED,
+                              font=ctk.CTkFont(size=11), anchor="w")
+        status.pack(fill="x", padx=16)
+        box = ctk.CTkScrollableFrame(win, fg_color=PANEL)
+        box.pack(fill="both", expand=True, padx=14, pady=(6, 14))
+        state = {"after": None, "gen": 0, "hits": []}
+
+        def jump(rel, line):
+            win.destroy()
+            self.open_file(rel, line=line)
+
+        def render(hits, gen):
+            if gen != state["gen"] or not win.winfo_exists():
+                return
+            for w in box.winfo_children():
+                w.destroy()
+            if not hits:
+                ctk.CTkLabel(box, text="No matches", text_color="#666",
+                             font=ctk.CTkFont(size=12)).pack(pady=20)
+                return
+            for rel, no, body in hits[:120]:
+                row = ctk.CTkButton(box, text=f"{rel}:{no}   {body}", anchor="w",
+                                    height=26, fg_color="transparent", hover_color=ACTIVE,
+                                    text_color=TEXT, font=ctk.CTkFont(family="Menlo", size=11),
+                                    command=lambda p=rel, n=no: jump(p, n))
+                row.pack(fill="x", padx=4, pady=0)
+            if len(hits) > 120:
+                ctk.CTkLabel(box, text=f"… {len(hits) - 120} more (narrow the query)",
+                             text_color="#666", font=ctk.CTkFont(size=10)).pack(pady=4)
+
+        def run(q, gen):
+            def bg():
+                try:
+                    hits, eng = self._project_search(tab.root, q)
+                except Exception as e:
+                    hits, eng = [], str(e)
+                payload = lambda: (state.update(hits=hits),
+                                   status.configure(text=f"{len(hits)} matches ({eng})"),
+                                   render(hits, gen))
+                # Tk serves cross-thread after() only while the main loop is
+                # active; retry briefly so results aren't lost if the main
+                # thread is momentarily between loop iterations.
+                for _ in range(40):
+                    try:
+                        self.after(0, payload)
+                        return
+                    except RuntimeError:
+                        time.sleep(0.05)
+            threading.Thread(target=bg, daemon=True).start()
+
+        def on_key(_e=None):
+            q = entry.get().strip()
+            state["gen"] += 1
+            gen = state["gen"]
+            if state["after"]:
+                try:
+                    win.after_cancel(state["after"])
+                except Exception:
+                    pass
+            state["after"] = None
+            if not q:
+                status.configure(text="Type to search the project")
+                for w in box.winfo_children():
+                    w.destroy()
+                return
+            status.configure(text="Searching…")
+            state["after"] = win.after(250, lambda: run(q, gen))
+
+        def on_enter(_e=None):
+            if state["hits"]:
+                rel, no, _b = state["hits"][0]
+                jump(rel, no)
+
+        entry.bind("<KeyRelease>", on_key)
+        entry.bind("<Return>", on_enter)
         entry.focus_set()
 
     # ---------------------------------------------------------- settings --
@@ -1057,8 +1317,8 @@ class MimoIDE(ctk.CTk):
                         pull_btn.configure(state="normal", text="Pull"),
                         self.refresh_available_models()))
                 except Exception as e:
-                    self.after(0, lambda: (status.configure(text=f"Error: {e}", text_color=RED),
-                                           pull_btn.configure(state="normal", text="Pull")))
+                    self.after(0, lambda e=e: (status.configure(text=f"Error: {e}", text_color=RED),
+                                             pull_btn.configure(state="normal", text="Pull")))
             threading.Thread(target=bg, daemon=True).start()
 
         pull_btn.configure(command=do_pull)
@@ -1070,7 +1330,7 @@ class MimoIDE(ctk.CTk):
                     r.raise_for_status()
                     models = r.json().get("models", [])
             except Exception as e:
-                self.after(0, lambda: status.configure(text=f"Cannot reach Ollama: {e}", text_color=RED))
+                self.after(0, lambda e=e: status.configure(text=f"Cannot reach Ollama: {e}", text_color=RED))
                 return
             self.after(0, lambda: self._fill_model_manager(box, status, models))
 
@@ -1132,7 +1392,7 @@ class MimoIDE(ctk.CTk):
                     text_color=GREEN if ok else RED),
                     self.refresh_available_models()))
             except Exception as e:
-                self.after(0, lambda: status.configure(text=f"Error: {e}", text_color=RED))
+                self.after(0, lambda e=e: status.configure(text=f"Error: {e}", text_color=RED))
         threading.Thread(target=bg, daemon=True).start()
 
     def close_tab(self, i):
@@ -1418,10 +1678,20 @@ class MimoIDE(ctk.CTk):
             pass
 
     def _render_transcript(self, tab):
+        # bumped on every full re-render so a deferred stream finalize can
+        # detect that its captured anchor is stale and skip repainting
+        tab.render_seq = getattr(tab, "render_seq", 0) + 1
         self.chat_display.configure(state="normal")
         self.chat_display.delete("1.0", "end")
         self.chat_display.configure(state="disabled")
-        for tag, text in tab.transcript[-MAX_TRANSCRIPT:]:
+        tb = self.chat_display._textbox
+        start = max(0, len(tab.transcript) - MAX_TRANSCRIPT)
+        for i in range(start, len(tab.transcript)):
+            tag, text = tab.transcript[i]
+            if i == tab.stream_idx:
+                # capture where the live streaming entry begins so later
+                # deltas can repaint just that block
+                tab.stream_anchor = tb.index("end-1c")
             self._render_entry(tag, text)
         if not tab.transcript:
             self._show_welcome()
@@ -1430,6 +1700,9 @@ class MimoIDE(ctk.CTk):
         tab = tab or self.active_tab()
         if tab is None:
             return
+        if tab.stream_idx is not None:
+            # seal the live streaming entry before appending anything after it
+            self._stream_end(tab)
         tab.transcript.append((tag, text))
         if len(tab.transcript) > MAX_TRANSCRIPT + 100:
             del tab.transcript[:200]
@@ -1540,8 +1813,53 @@ class MimoIDE(ctk.CTk):
         if sid:
             tab.session_id = sid
             _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
-            self.append_chat(f"↩ Next message resumes session {sid}", tag="system")
             self._load_session_tasks(tab, sid)
+            self._load_session_transcript(tab, sid)
+
+    @staticmethod
+    def _is_loop_garbage(text: str) -> bool:
+        if len(text) < 200:
+            return False
+        for probe in (20, 28, 40):
+            head = text[:probe].strip()
+            if len(head.split()) >= 3 and text.count(head) >= 3:
+                return True
+        return False
+
+    def _load_session_transcript(self, tab, sid):
+        path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+        try:
+            with open(path, encoding="utf-8") as f:
+                data = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return
+        messages = data.get("messages") or []
+        entries = []
+        for m in messages:
+            role = m.get("role", "")
+            content = (m.get("content") or "").strip()
+            if not content:
+                continue
+            if role == "system":
+                continue
+            if role == "user":
+                entries.append(("goal", content))
+            elif role == "assistant":
+                if m.get("tool_calls"):
+                    for tc in m["tool_calls"]:
+                        fn = tc.get("function", {})
+                        entries.append(("activity", f"🔧 {fn.get('name', '?')} {str(fn.get('arguments', ''))[:120]}"))
+                elif self._is_loop_garbage(content):
+                    continue
+                elif content:
+                    entries.append(("assistant", content))
+            elif role == "tool":
+                short = content[:200].replace("\n", " ")
+                entries.append(("observation", short))
+        tab.transcript = entries[-MAX_TRANSCRIPT:]
+        if tab is self.active_tab():
+            self._render_transcript(tab)
+            self.append_chat(f"↩ Loaded {len(entries)} messages from session {sid}", tag="system")
 
     def _load_session_tasks(self, tab, sid):
         try:
@@ -1723,6 +2041,32 @@ class MimoIDE(ctk.CTk):
         done = sum(1 for t in tab.tasks_data if t.get("status") == "done")
         return f"☑ Tasks updated — {done}/{len(tab.tasks_data)} done"
 
+    def _track_context_file(self, line, tab):
+        m = re.search(r"(?:OK: (?:wrote|edited|deleted) |📖 )(\S+\.\w+)", line)
+        if not m:
+            return
+        path = m.group(1)
+        if path not in tab.context_files:
+            tab.context_files.append(path)
+            if len(tab.context_files) > 30:
+                tab.context_files = tab.context_files[-30:]
+            if tab is self.active_tab():
+                self.after(0, self._update_context_bar)
+
+    def _update_context_bar(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        files = tab.context_files
+        if not files:
+            self.chat_ctx_label.configure(text="")
+            return
+        shown = files[-5:]
+        txt = " · ".join(shown)
+        if len(files) > 5:
+            txt = f"+{len(files) - 5} more · {txt}"
+        self.chat_ctx_label.configure(text=f"ctx: {txt}")
+
     def new_chat(self):
         tab = self.active_tab()
         if not tab:
@@ -1778,7 +2122,9 @@ class MimoIDE(ctk.CTk):
         if tab is None:
             return
         try:
-            tab.editor_text = self.editor_box.get("1.0", "end-1c")
+            # keep the live buffer separate from the on-disk snapshot so
+            # unsaved edits survive tab switches and dirty state stays honest
+            tab.editor_buf = self.editor_box.get("1.0", "end-1c")
         except Exception:
             pass
 
@@ -1819,13 +2165,13 @@ class MimoIDE(ctk.CTk):
         ext = os.path.splitext(path)[1].lower()
         return self._SYNTAX_LANGS.get(ext)
 
-    def _highlight_editor(self, lang):
-        tb = self.editor_box._textbox
-        for tag in ("kw", "str", "com", "num", "dec", "fn", "op"):
-            tb.tag_remove(tag, "1.0", "end")
-        if not lang:
-            return
-        text = tb.get("1.0", "end-1c")
+    _PATTERN_CACHE = {}
+
+    def _syntax_patterns(self, lang):
+        """Compiled (tag, regex) pairs per language — built once, reused."""
+        cached = self._PATTERN_CACHE.get(lang)
+        if cached is not None:
+            return cached
         if lang == "python":
             kw, dec = self._PY_KW, ("def", "class")
         elif lang == "js":
@@ -1857,12 +2203,58 @@ class MimoIDE(ctk.CTk):
         if lang in ("python", "js"):
             patterns.append(("fn", re.compile(r"\b[A-Za-z_]\w*(?=\()")))
         patterns.append(("op", re.compile(r"[=+\-*/%<>!&|^~?:]+")))
+        self._PATTERN_CACHE[lang] = patterns
+        return patterns
+
+    def _visible_line_range(self):
+        tb = self.editor_box._textbox
+        total = int(tb.index("end-1c").split(".")[0])
+        try:
+            first, last = tb.yview()
+        except Exception:
+            first, last = 0.0, 1.0
+        start = max(1, int(first * total) - 8)
+        end = min(total, int(last * total) + 12)
+        return start, end, total
+
+    def _highlight_editor(self, lang, start_line=None, end_line=None):
+        """Syntax-highlight a line range (default: the visible viewport).
+
+        Only the viewport is repainted, so cost stays constant no matter how
+        big the file is — the old implementation ran every regex over the
+        whole file on each keystroke and lagged on 5k+ line files.
+        """
+        tb = self.editor_box._textbox
+        if start_line is None:
+            start_line, end_line, total = self._visible_line_range()
+        else:
+            total = int(tb.index("end-1c").split(".")[0])
+        start_line = max(1, int(start_line))
+        end_line = min(total, max(int(end_line or start_line), start_line))
+        s_idx, e_idx = f"{start_line}.0", f"{end_line}.end"
+        for tag in ("kw", "str", "com", "num", "dec", "fn", "op"):
+            tb.tag_remove(tag, s_idx, e_idx)
+        if not lang:
+            return
+        patterns = self._syntax_patterns(lang)
+        text = tb.get(s_idx, e_idx)
+        if not text:
+            return
+        lines = text.split("\n")
+        starts = [0]
+        for ln in lines[:-1]:
+            starts.append(starts[-1] + len(ln) + 1)
+
+        def to_idx(off):
+            li = bisect.bisect_right(starts, off) - 1
+            li = max(0, min(li, len(lines) - 1))
+            return start_line + li, off - starts[li]
 
         for tag, pat in patterns:
             for m in pat.finditer(text):
-                s = f"1.0+{m.start()}c"
-                e = f"1.0+{m.end()}c"
-                tb.tag_add(tag, s, e)
+                sl, sc = to_idx(m.start())
+                el, ec = to_idx(m.end())
+                tb.tag_add(tag, f"{sl}.{sc}", f"{el}.{ec}")
 
     def _update_gutter(self):
         tb = self.editor_box._textbox
@@ -1879,11 +2271,34 @@ class MimoIDE(ctk.CTk):
         except Exception:
             pass
 
-    def _on_editor_changed(self, _event=None):
-        self._update_gutter()
-        self._highlight_editor(self._lang_for_path(self.active_tab().editor_path if self.active_tab() else None))
+    def _on_editor_scroll(self, _event=None):
         self._sync_gutter_scroll()
+        # paint syntax for lines that just scrolled into view (throttled)
+        self._schedule_highlight(140)
+
+    def _schedule_highlight(self, delay=160):
+        after_id = getattr(self, "_hl_after", None)
+        if after_id is not None:
+            try:
+                self.after_cancel(after_id)
+            except Exception:
+                pass
+        self._hl_after = self.after(delay, self._do_highlight)
+
+    def _do_highlight(self):
+        self._hl_after = None
+        tab = self.active_tab()
+        if tab is None:
+            return
+        self._update_gutter()
+        self._highlight_editor(self._lang_for_path(tab.editor_path))
+        self._sync_gutter_scroll()
+
+    def _on_editor_changed(self, _event=None):
+        # dirty-state stays immediate; gutter + syntax highlighting is
+        # debounced so typing never blocks on regex over the file
         self._mark_editor_dirty()
+        self._schedule_highlight(180)
 
     def reload_editor(self):
         tab = self.active_tab()
@@ -1897,6 +2312,7 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"❌ Reload failed: {e}", tag="error")
             return
         tab.editor_text = content
+        tab.editor_buf = content
         tab.editor_dirty = False
         self._restore_editor(tab)
         self.append_chat(f"⟳ Reloaded {tab.editor_path} from disk", tag="system")
@@ -1919,6 +2335,7 @@ class MimoIDE(ctk.CTk):
             return
         if disk != tab.editor_text:
             tab.editor_text = disk
+            tab.editor_buf = disk
             if tab is self.active_tab():
                 self._restore_editor(tab)
                 self.append_chat(f"⟳ Editor synced — {tab.editor_path} was updated by the agent.",
@@ -2000,19 +2417,205 @@ class MimoIDE(ctk.CTk):
             n = int(self.goto_entry.get().strip())
         except ValueError:
             return
-        tb = self.editor_box._textbox
-        total = int(tb.index("end-1c").split(".")[0])
-        n = max(1, min(n, total))
-        tb.mark_set("insert", f"{n}.0")
-        tb.see(f"{n}.0")
+        self.goto_line_number(n)
         self.goto_bar.grid_remove()
         self.editor_box.focus_set()
 
+    def goto_line_number(self, n):
+        tb = self.editor_box._textbox
+        total = int(tb.index("end-1c").split(".")[0])
+        n = max(1, min(int(n), total))
+        tb.mark_set("insert", f"{n}.0")
+        tb.see(f"{n}.0")
+        try:
+            tb.tag_remove("findhl", "1.0", "end")
+            tb.tag_configure("findhl", background="#4A3A00", foreground="#FFE082")
+            tb.tag_add("findhl", f"{n}.0", f"{n}.end")
+        except Exception:
+            pass
+        # the viewport moved without a scroll event — repaint its syntax
+        self._schedule_highlight(60)
+
+    def toggle_inline_bar(self):
+        self.main_tabs.set("Editor")
+        if self.inline_bar.winfo_ismapped():
+            self.inline_bar.grid_remove()
+        else:
+            self.inline_bar.grid()
+            self.inline_entry.focus_set()
+            self.inline_entry.select_range(0, "end")
+
+    def _hide_inline_bar(self):
+        self.inline_bar.grid_remove()
+        self.editor_box.focus_set()
+
+    def _send_inline_edit(self):
+        instruction = self.inline_entry.get().strip()
+        if not instruction:
+            return
+        tb = self.editor_box._textbox
+        sel = tb.tag_ranges("sel")
+        if sel:
+            selected = tb.get(sel[0], sel[1])
+        else:
+            selected = tb.get("1.0", "end-1c")[:2000]
+        self.inline_entry.delete(0, "end")
+        tab = self.active_tab()
+        if not tab or not tab.editor_path:
+            # no file open — plain chat prompt, no diff review
+            self._hide_inline_bar()
+            prompt = (f"Instruction: {instruction}\n"
+                      f"Selected code:\n```\n{selected}\n```\n"
+                      f"Apply the change, then verify it compiles/runs.")
+            self.main_tabs.set("Chat")
+            self.user_input.delete("1.0", "end")
+            self.user_input.insert("1.0", prompt)
+            self._refresh_input_hint()
+            self.send_request()
+            return
+        rel = tab.editor_path
+        # snapshot the file on disk BEFORE the agent runs → diff review after
+        try:
+            with open(os.path.join(tab.root, rel), encoding="utf-8", errors="replace") as f:
+                before = f.read()
+        except OSError:
+            before = None
+        tab.inline_preview = {"path": rel, "before": before}
+        prompt = (f"Inline edit of `{rel}` — this is the ONLY file you may change.\n\n"
+                  f"Selected code:\n```\n{selected}\n```\n\n"
+                  f"Instruction: {instruction}\n\n"
+                  f"Apply the change to `{rel}` with edit_file (or write_file for a full "
+                  f"rewrite), then verify it still parses/compiles. Do not modify any other file.")
+        self._hide_inline_bar()
+        self.main_tabs.set("Chat")
+        self.user_input.delete("1.0", "end")
+        self.user_input.insert("1.0", prompt)
+        self._refresh_input_hint()
+        self.send_request()
+
+    def _review_inline_edit(self, tab):
+        """After a ⌘K run: diff the target file against the pre-run snapshot
+        and open an Accept/Reject review window when it changed."""
+        prev = tab.inline_preview
+        tab.inline_preview = None
+        if not prev:
+            return
+        rel, before = prev["path"], prev["before"]
+        path = os.path.join(tab.root, rel)
+        try:
+            with open(path, encoding="utf-8", errors="replace") as f:
+                after = f.read()
+        except OSError:
+            after = None
+        if after is None and before is None:
+            return
+        if after == before:
+            if tab is self.active_tab():
+                self.append_chat(f"⌘K: no change was produced in {rel}.", tag="system", tab=tab)
+            return
+        self._show_diff_preview(tab, rel, before or "", after or "")
+
+    def _show_diff_preview(self, tab, rel, before, after):
+        win = ctk.CTkToplevel(self)
+        win.title(f"Review change — {rel}")
+        win.geometry("900x580")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+
+        hdr = ctk.CTkFrame(win, fg_color="transparent")
+        hdr.pack(fill="x", padx=14, pady=(12, 6))
+        ctk.CTkLabel(hdr, text=f"◈ {rel}", text_color=GOLD,
+                     font=ctk.CTkFont(size=14, weight="bold")).pack(side="left")
+        b_count = len(before.splitlines())
+        a_count = len(after.splitlines())
+        ctk.CTkLabel(hdr, text=f"{b_count} → {a_count} lines · proposed by the agent",
+                     text_color=MUTED, font=ctk.CTkFont(size=11)).pack(side="right")
+
+        # plain Tk Text, styled to match: customtkinter's CTkTextbox floods
+        # the event loop when created in a Toplevel while the main window is
+        # unmapped (minimized/withdrawn), freezing the whole app. Plain Text
+        # looks identical and is safe in both states (verified both ways).
+        tb = tk.Text(win, wrap="none", bg="#0A0A0A", fg="#D4D4D4",
+                     insertbackground="#D4D4D4", relief="flat", highlightthickness=0,
+                     font=("Menlo", 12), padx=8, pady=8)
+        tb.pack(fill="both", expand=True, padx=14, pady=4)
+        tb.tag_configure("add", foreground="#66BB6A", background="#12261A")
+        tb.tag_configure("del", foreground="#EF5350", background="#2A1414")
+        tb.tag_configure("hunk", foreground="#64B5F6")
+        tb.tag_configure("hdr", foreground=GOLD)
+
+        diff = list(difflib.unified_diff(before.splitlines(), after.splitlines(),
+                                         fromfile=f"a/{rel}", tofile=f"b/{rel}", lineterm=""))
+        if not diff:
+            diff = ["(whitespace-only or line-ending change)"]
+        for i, ln in enumerate(diff[:4000]):
+            if ln.startswith("+++") or ln.startswith("---"):
+                tag = "hdr"
+            elif ln.startswith("@@"):
+                tag = "hunk"
+            elif ln.startswith("+"):
+                tag = "add"
+            elif ln.startswith("-"):
+                tag = "del"
+            else:
+                tag = None
+            tb.insert("end", ln + "\n", tag)
+        if len(diff) > 4000:
+            tb.insert("end", f"… {len(diff) - 4000} more diff lines omitted\n", "hunk")
+        tb.configure(state="disabled")
+
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=14, pady=(6, 14))
+        ctk.CTkLabel(btns, text="Close (✕) keeps the changes",
+                     text_color="#666", font=ctk.CTkFont(size=10)).pack(side="left")
+
+        def accept(_=None):
+            win.destroy()
+            self.append_chat(f"✓ Accepted — kept changes to {rel}", tag="success", tab=tab)
+            self._render_files(tab)
+            self.refresh_changes_panel(silent=True)
+            self._sync_editor_from_disk(tab)
+
+        def reject():
+            win.destroy()
+            try:
+                with open(os.path.join(tab.root, rel), "w", encoding="utf-8") as f:
+                    f.write(before)
+            except OSError as e:
+                self.append_chat(f"❌ Reject failed: {e}", tag="error", tab=tab)
+                return
+            tab.editor_text = before
+            tab.editor_buf = before
+            tab.editor_dirty = False
+            if tab is self.active_tab():
+                self._restore_editor(tab)
+            self.append_chat(f"↩ Rejected — {rel} restored to its pre-edit state.",
+                             tag="system", tab=tab)
+            self._render_files(tab)
+            self.refresh_changes_panel(silent=True)
+
+        ctk.CTkButton(btns, text="✓ Accept", width=120, height=34, fg_color=GREEN,
+                      hover_color="#4CAF50", text_color="#000",
+                      font=ctk.CTkFont(weight="bold"), command=accept).pack(side="right", padx=(8, 0))
+        ctk.CTkButton(btns, text="✕ Reject", width=120, height=34, fg_color="#4A1A1A",
+                      hover_color="#5C2222", text_color=RED,
+                      font=ctk.CTkFont(weight="bold"), command=reject).pack(side="right")
+        win.protocol("WM_DELETE_WINDOW", accept)
+
     def _restore_editor(self, tab):
+        text = tab.editor_buf if tab.editor_buf is not None else (tab.editor_text or "")
         self.editor_box.delete("1.0", "end")
-        self.editor_box.insert("1.0", tab.editor_text or "")
-        tab.editor_dirty = False
+        self.editor_box.insert("1.0", text)
+        tab.editor_dirty = bool(tab.editor_path) and text != (tab.editor_text or "")
         self._update_editor_status(tab)
+        if getattr(self, "_hl_after", None):
+            try:
+                self.after_cancel(self._hl_after)
+            except Exception:
+                pass
+            self._hl_after = None
         self._update_gutter()
         self._highlight_editor(self._lang_for_path(tab.editor_path))
         self._sync_gutter_scroll()
@@ -2039,7 +2642,7 @@ class MimoIDE(ctk.CTk):
         tab.editor_dirty = current != tab.editor_text
         self._update_editor_status(tab)
 
-    def open_file(self, rel):
+    def open_file(self, rel, line=None):
         tab = self.active_tab()
         if not tab:
             return
@@ -2056,7 +2659,10 @@ class MimoIDE(ctk.CTk):
             return
         tab.editor_path = rel
         tab.editor_text = content
+        tab.editor_buf = content
         self._restore_editor(tab)
+        if line:
+            self.goto_line_number(line)
         self.main_tabs.set("Editor")
 
     def save_editor(self):
@@ -2071,6 +2677,7 @@ class MimoIDE(ctk.CTk):
             self.append_chat(f"❌ Save failed: {e}", tag="error")
             return
         tab.editor_text = content
+        tab.editor_buf = content
         tab.editor_dirty = False
         self._update_editor_status(tab)
         self.append_chat(f"💾 Saved {tab.editor_path}", tag="success")
@@ -2109,6 +2716,74 @@ class MimoIDE(ctk.CTk):
         self.terminal_box.configure(state="normal")
         self.terminal_box.delete("1.0", "end")
         self.terminal_box.configure(state="disabled")
+
+    def _shell_start(self):
+        if self.shell_proc and self.shell_proc.poll() is None:
+            return
+        import pty, select
+        tab = self.active_tab()
+        cwd = tab.root if tab else os.getcwd()
+        self.shell_proc = pty.fork()
+        if self.shell_proc[0] == 0:
+            os.execvp("bash", ["bash", "-i"])
+        pid, fd = self.shell_proc
+        os.set_blocking(fd, False)
+        self.shell_box.configure(state="normal")
+        self.shell_box.delete("1.0", "end")
+        self.shell_box.insert("end", f"$ bash (pid {pid}) — type below, ⏎ to run\n\n")
+        self.shell_box.configure(state="disabled")
+        self._shell_fd = fd
+        self._shell_read_loop(fd)
+
+    def _shell_read_loop(self, fd):
+        import select
+        try:
+            r, _, _ = select.select([fd], [], [], 0.05)
+            if r:
+                data = os.read(fd, 4096).decode("utf-8", errors="replace")
+                self.shell_box.configure(state="normal")
+                self.shell_box.insert("end", data)
+                self.shell_box.see("end")
+                self.shell_box.configure(state="disabled")
+        except OSError:
+            self._shell_kill()
+            return
+        if self.shell_proc and self.shell_proc[0] and self.shell_proc[0].poll() is None:
+            self.after(50, lambda: self._shell_read_loop(fd))
+
+    def _on_shell_key(self, event):
+        if not self.shell_proc or self.shell_proc[0] is None:
+            return
+        if event.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R",
+                            "Alt_L", "Alt_R", "Meta_L", "Meta_R"):
+            return
+        pid, fd = self.shell_proc
+        ch = event.char if event.char else ""
+        if event.keysym == "Return":
+            ch = "\r"
+        elif event.keysym == "BackSpace":
+            ch = "\x7f"
+        elif event.keysym == "Tab":
+            ch = "\t"
+        elif not ch:
+            return
+        try:
+            os.write(fd, ch.encode())
+        except OSError:
+            pass
+
+    def _shell_kill(self):
+        if self.shell_proc and self.shell_proc[0]:
+            try:
+                os.kill(self.shell_proc[0], 9)
+            except OSError:
+                pass
+        self.shell_proc = None
+
+    def _shell_clear(self):
+        self.shell_box.configure(state="normal")
+        self.shell_box.delete("1.0", "end")
+        self.shell_box.configure(state="disabled")
 
     def run_tests(self):
         tab = self.active_tab()
@@ -2149,8 +2824,8 @@ class MimoIDE(ctk.CTk):
                 self.after(0, lambda: (self.append_chat("❌ Tests timed out (180s).", tag="error"),
                                        self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
             except OSError as e:
-                self.after(0, lambda: (self.append_chat(f"❌ {e}", tag="error"),
-                                       self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
+                self.after(0, lambda e=e: (self.append_chat(f"❌ {e}", tag="error"),
+                                         self.run_tests_btn.configure(state="normal", text="🧪 Run tests")))
         threading.Thread(target=bg, daemon=True).start()
 
     def _render_terminal(self, tab):
@@ -2212,15 +2887,38 @@ class MimoIDE(ctk.CTk):
             path = path.strip('"')
             key = st.strip()[0] if st.strip() else "?"
             color = status_colors.get(key, MUTED)
-            btn = ctk.CTkButton(self.changes_list, text=f"{st.strip():2} {path}", anchor="w",
+            row = ctk.CTkFrame(self.changes_list, fg_color="transparent")
+            row.pack(fill="x", padx=4, pady=0)
+            btn = ctk.CTkButton(row, text=f"{st.strip():2} {path}", anchor="w",
                                 height=24, fg_color="transparent", hover_color=ACTIVE,
                                 text_color=color, font=ctk.CTkFont(family="Menlo", size=11),
                                 command=lambda p=path, s=key: self._select_change(p, s))
-            btn.pack(fill="x", padx=4, pady=0)
+            btn.pack(side="left", fill="x", expand=True)
+            rev = ctk.CTkButton(row, text="↩", width=24, height=22,
+                                fg_color="transparent", hover_color="#4A1A1A",
+                                text_color="#666", font=ctk.CTkFont(size=11),
+                                command=lambda p=path: self._revert_file(p))
+            rev.pack(side="right", padx=(2, 0))
+            openb = ctk.CTkButton(row, text="↗", width=24, height=22,
+                                  fg_color="transparent", hover_color=ACTIVE,
+                                  text_color="#666", font=ctk.CTkFont(size=11),
+                                  command=lambda p=path: self.open_file(p))
+            openb.pack(side="right", padx=(2, 0))
             tab.changed_files[path] = key
         if not silent:
             first = next(iter(tab.changed_files))
             self._select_change(first, tab.changed_files[first])
+
+    def _revert_file(self, path):
+        tab = self.active_tab()
+        if not tab:
+            return
+        code, out = self._git(tab, "checkout", "--", path)
+        if code == 0:
+            self.append_chat(f"↩ Reverted {path}", tag="system")
+        else:
+            self.append_chat(f"❌ Revert failed: {out.strip()[:200]}", tag="error")
+        self.refresh_changes_panel(silent=True)
 
     def _select_change(self, path, status):
         tab = self.active_tab()
@@ -2271,6 +2969,8 @@ class MimoIDE(ctk.CTk):
             self.git_status_label.configure(text=f"○ {tab.name} — no git repository connected",
                                             text_color=MUTED)
             tab.git_branch = ""
+            self.git_branch_menu.configure(values=["(branch)"])
+            self.git_branch_var.set("(branch)")
             self._render_git_log("")
             return
         _c, branch = self._git(tab, "rev-parse", "--abbrev-ref", "HEAD")
@@ -2281,7 +2981,13 @@ class MimoIDE(ctk.CTk):
         self.git_status_label.configure(
             text=f"● {tab.name} · branch {tab.git_branch} · {n} uncommitted change{'s' if n != 1 else ''}",
             text_color=GREEN if n == 0 else GOLD)
-        _c3, log = self._git(tab, "log", "--oneline", "-15")
+        _c3, branches = self._git(tab, "branch", "--format=%(refname:short)")
+        blist = [b.strip() for b in branches.splitlines() if b.strip()]
+        if blist:
+            self.git_branch_menu.configure(values=blist)
+            if tab.git_branch in blist:
+                self.git_branch_var.set(tab.git_branch)
+        _c4, log = self._git(tab, "log", "--oneline", "-15")
         self._render_git_log(log.strip())
 
     def _render_git_log(self, log):
@@ -2300,6 +3006,15 @@ class MimoIDE(ctk.CTk):
         self.append_terminal(f"$ git init\n{out}", tab)
         self.refresh_git_panel()
         self.refresh_changes_panel()
+
+    def git_stage_all(self):
+        self._git_action("add", ["add", "-A"])
+
+    def _on_branch_select(self, branch):
+        tab = self.active_tab()
+        if not tab or not branch or branch == "(branch)":
+            return
+        self._git_action(f"checkout {branch}", ["checkout", branch])
 
     def _git_action(self, name, args, extra_note=""):
         tab = self.active_tab()
@@ -2364,6 +3079,89 @@ class MimoIDE(ctk.CTk):
         self.append_chat("🖼️ Image pasted from clipboard", tag="system")
         self._sync_attachment_ui()
 
+    @staticmethod
+    def _restore_checkpoint(root, ckpt_dir):
+        """Restore the newest agent checkpoint in `ckpt_dir`, without importing
+        the agent engine. Understands both checkpoint formats:
+          - git-native: manifest {files, blobs} — pre-image read from .git/objects
+          - legacy:     manifest {files} + byte-copied files/ tree
+        Returns a human-readable status string.
+        """
+        dirs = sorted((d for d in os.scandir(ckpt_dir) if d.is_dir() and d.name.isdigit()),
+                      key=lambda d: d.name)
+        if not dirs:
+            return "Nothing to undo."
+        d = dirs[-1]
+        try:
+            with open(os.path.join(d.path, "manifest.json"), encoding="utf-8") as f:
+                manifest = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            return "❌ Checkpoint is corrupt."
+        blobs = manifest.get("blobs") or {}
+        restored, deleted, failed = [], [], []
+        for rel, kind in (manifest.get("files") or {}).items():
+            live = os.path.join(root, rel)
+            if kind == "created":
+                if os.path.isfile(live):
+                    try:
+                        os.remove(live)
+                        deleted.append(rel)
+                    except OSError as e:
+                        failed.append(f"{rel} ({e})")
+                continue
+            data = None
+            sha = blobs.get(rel)
+            if sha and re.fullmatch(r"[0-9a-f]{40,64}", sha):
+                try:
+                    r = subprocess.run(["git", "-C", root, "cat-file", "blob", sha],
+                                       capture_output=True, timeout=30)
+                    if r.returncode == 0:
+                        data = r.stdout
+                except (OSError, subprocess.TimeoutExpired):
+                    pass
+            if data is None:
+                legacy = os.path.join(d.path, "files", rel)
+                if os.path.isfile(legacy):
+                    try:
+                        with open(legacy, "rb") as f:
+                            data = f.read()
+                    except OSError:
+                        pass
+            if data is None:
+                failed.append(rel)
+                continue
+            try:
+                os.makedirs(os.path.dirname(live) or root, exist_ok=True)
+                with open(live, "wb") as f:
+                    f.write(data)
+                restored.append(rel)
+            except OSError as e:
+                failed.append(f"{rel} ({e})")
+        for p in sorted((os.path.join(dp, fp) for dp, dn, fn in os.walk(d.path)
+                         for fp in fn), reverse=True):
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+        for dp, dn, fn in os.walk(d.path, topdown=False):
+            for dn_ in dn:
+                try:
+                    os.rmdir(os.path.join(dp, dn_))
+                except OSError:
+                    pass
+        try:
+            os.rmdir(d.path)
+        except OSError:
+            pass
+        parts = []
+        if restored:
+            parts.append("restored " + ", ".join(restored))
+        if deleted:
+            parts.append("removed " + ", ".join(deleted))
+        if failed:
+            parts.append("⚠ could not restore: " + ", ".join(failed))
+        return "OK: undo — " + ("; ".join(parts) if parts else "removed empty checkpoint")
+
     def gui_undo(self):
         tab = self.active_tab()
         if not tab:
@@ -2372,27 +3170,18 @@ class MimoIDE(ctk.CTk):
         if not os.path.isdir(ckpt) or not os.listdir(ckpt):
             self.append_chat("Nothing to undo — no checkpoints yet.", tag="system")
             return
-        py = get_agent_python()
-        if not py:
-            self.append_chat("❌ No python with the 'ollama' package found.", tag="error")
-            return
         self.append_chat("↩ Undoing last agent change…", tag="system")
+        root, ckpt_dir = tab.root, ckpt
 
         def bg():
             try:
-                r = subprocess.run(
-                    [py, "-c",
-                     "import sys; sys.path.insert(0, r'/Users/user/Desktop/ai-agent'); "
-                     "import agent; agent.WORKDIR = sys.argv[1]; "
-                     "print(agent.execute('undo', {}))",
-                     tab.root],
-                    capture_output=True, text=True, timeout=30, cwd=tab.root)
-                out = (r.stdout or r.stderr or "").strip()
-                self.after(0, lambda: (self.append_chat(out or "Undo done.", tag="observation"),
+                out = self._restore_checkpoint(root, ckpt_dir)
+                self.after(0, lambda: (self.append_chat(out, tag="observation"),
                                        self._render_files(tab),
-                                       self.refresh_changes_panel(silent=True)))
+                                       self.refresh_changes_panel(silent=True),
+                                       self._sync_editor_from_disk(tab)))
             except Exception as e:
-                self.after(0, lambda: self.append_chat(f"❌ Undo failed: {e}", tag="error"))
+                self.after(0, lambda e=e: self.append_chat(f"❌ Undo failed: {e}", tag="error"))
         threading.Thread(target=bg, daemon=True).start()
 
     def _sync_attachment_ui(self):
@@ -2403,9 +3192,28 @@ class MimoIDE(ctk.CTk):
             self.chip_label.configure(text=f"🖼  {name}")
             self.chip_frame.grid()
             self.img_button.configure(fg_color=GOLD, text_color="#000")
+            self._show_image_preview(tab.attached_image)
         else:
             self.chip_frame.grid_remove()
             self.img_button.configure(fg_color=CARD, text_color=TEXT)
+            self._hide_image_preview()
+
+    def _show_image_preview(self, path):
+        try:
+            from PIL import Image, ImageTk
+            img = Image.open(path)
+            img.thumbnail((48, 48))
+            self._preview_img = ImageTk.PhotoImage(img)
+            if not hasattr(self, "_preview_label"):
+                self._preview_label = ctk.CTkLabel(self.chip_frame, text="", width=48, height=48)
+                self._preview_label.pack(side="left", padx=(0, 6), pady=2)
+            self._preview_label.configure(image=self._preview_img, text="")
+        except Exception:
+            pass
+
+    def _hide_image_preview(self):
+        if hasattr(self, "_preview_label"):
+            self._preview_label.configure(image="", text="")
 
     def _clear_attachment(self):
         tab = self.active_tab()
@@ -2494,6 +3302,264 @@ class MimoIDE(ctk.CTk):
     _SPIN_FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
     _WORK_PHASE_RE = re.compile(r"^[✦◆]\s*(.*)$")
     _WORK_STEP_RE = re.compile(r"^\[(\d+)/(\d+)\]\s*(.*)$")
+
+    # ---------------------------------------------------- engine events --
+    def _handle_engine_event(self, ev, tab):
+        """Dispatch one JSONL event from the engine.
+
+        Runs on the engine worker thread; widget touches go through self.after
+        or the thread-safe append_chat (same contract as the legacy path).
+        """
+        t = ev["evt"]
+        if t == "intent":
+            it = ev.get("intent") or ""
+            labels = {"trivial": "💬 Greeting",
+                      "fast": "⚡ Quick answer",
+                      "plan": "🧭 Plan · analysis only (read-only)",
+                      "build": "🔨 Build · plan → execute → verify"}
+            self.append_chat(labels.get(it, f"Mode: {it}"), tag="system", tab=tab)
+            return
+        if t == "delta":
+            self._stream_delta(tab, ev.get("text") or "")
+            return
+        if t == "stream_fix":
+            self._stream_fix(tab, ev.get("text") or "", ev.get("note") or "")
+            return
+        if t == "text_end":
+            self._stream_end(tab)
+            return
+        if t == "thinking":
+            txt = (ev.get("text") or "").strip()
+            if txt:
+                self.append_terminal("⋯ " + txt[:300], tab)
+            return
+        if t == "tool_start":
+            name = ev.get("name") or "?"
+            args = (ev.get("args") or "").strip()
+            step, total = ev.get("step"), ev.get("total")
+            line = (f"[{step}/{total}] {name} {args}".strip()
+                    if step else f"{name} {args}".strip())
+            self.append_terminal(line, tab)
+            # fires BEFORE the tool runs — the work card can show it live
+            self._work_card_update(tab, action=f"{name} {args}".strip())
+            self.append_chat(line, tag="activity", tab=tab)
+            return
+        if t == "tool_end":
+            preview = (ev.get("preview") or "").strip()
+            if not preview:
+                return
+            for ln in preview.splitlines()[:6]:
+                self.append_terminal(ln, tab)
+            first = preview.splitlines()[0][:300]
+            tag, text = self._classify_engine_line(first)
+            if tag != "silent" and text:
+                self.append_chat(text, tag=tag, tab=tab)
+            return
+        if t == "phase":
+            body = re.sub(r"\[\d+/\d+\]\s*", "", (ev.get("label") or "")).strip()
+            phase_label = body or "Working…"
+            for key, lab in self._PHASE_KEYWORDS:
+                if key in body:
+                    phase_label = lab
+                    break
+            note = (ev.get("note") or "").strip()
+            step, total = ev.get("step"), ev.get("total")
+            self._work_card_update(
+                tab, phase=phase_label,
+                step=f"step {step}/{total}" if step and total else "",
+                action=(f"{body} — {note}" if note else ""))
+            return
+        if t == "tasks":
+            tab.tasks_data = list(ev.get("tasks") or [])
+            if tab is self.active_tab():
+                self.after(0, self.refresh_tasks_panel)
+            return
+        if t == "metrics":
+            try:
+                pt = int(ev.get("prompt") or 0)
+                gt = int(ev.get("gen") or 0)
+                calls = int(ev.get("tool_calls") or 0)
+                dur = float(ev.get("duration") or 0)
+            except (TypeError, ValueError):
+                return
+            def _fmt(n):
+                return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+            self.append_chat(
+                f"📊 {_fmt(pt)} prompt + {_fmt(gt)} gen tokens · {calls} tool calls · {dur:.0f}s",
+                tag="system", tab=tab)
+            return
+        if t == "usage":
+            try:
+                pt = int(ev.get("prompt") or 0)
+                gt = int(ev.get("gen") or 0)
+            except (TypeError, ValueError):
+                return
+            tab.last_prompt_tokens = pt
+            tab.last_gen_tokens = gt
+            tab.total_prompt_tokens = getattr(tab, "total_prompt_tokens", 0) + pt
+            tab.total_gen_tokens = getattr(tab, "total_gen_tokens", 0) + gt
+            return
+        if t == "session":
+            sid = ev.get("id")
+            if sid and sid != tab.session_id:
+                tab.session_id = sid
+                _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
+                self.after(0, lambda: self.refresh_sessions(tab, keep_selection=True))
+            return
+        if t == "plan":
+            plan = (ev.get("plan") or "").strip()
+            if plan:
+                self.append_chat("📋 **Proposed plan**\n" + plan, tag="assistant", tab=tab)
+            return
+        if t in ("notice", "error"):
+            msg = (ev.get("msg") or "").strip()
+            if not msg:
+                return
+            lines = msg.splitlines()
+            tag, text = self._classify_engine_line(lines[0])
+            if tag is None:
+                tag = "error" if t == "error" else "assistant"
+            elif tag == "silent":
+                tag = "system"
+            if len(lines) > 1:
+                # classify picks the tag from the first line, but multi-line
+                # notices must keep their body (headings, lists, details)
+                text = msg
+            self.append_chat(text or msg, tag=tag, tab=tab)
+            return
+        # unknown event types are ignored on purpose (forward compatible)
+
+    # --------------------------------------------------- streaming text --
+    def _stream_delta(self, tab, text):
+        """Append a streamed model-text delta to the live assistant entry."""
+        if not text:
+            return
+        if tab.stream_idx is None:
+            tab.stream_buf = text
+            tab.transcript.append(("assistant", ""))
+            tab.stream_idx = len(tab.transcript) - 1
+            tab.stream_anchor = None
+        else:
+            tab.stream_buf = (tab.stream_buf or "") + text
+        tab.transcript[tab.stream_idx] = ("assistant", tab.stream_buf)
+        if not tab.stream_pending:
+            tab.stream_pending = True
+            self.after(50, lambda: self._flush_stream(tab))
+
+    def _stream_fix(self, tab, text, note):
+        """Replace the live streaming entry after the engine cut a loop.
+
+        The garbage was already painted delta by delta; this swaps the buffer
+        for the clean text (or drops it entirely and shows the note).
+        """
+        if tab.stream_idx is None:
+            if text:
+                self.append_chat(text, tag="assistant", tab=tab)
+            elif note:
+                self.append_chat(note, tag="system", tab=tab)
+            return
+        if text:
+            tab.stream_buf = text
+            tab.transcript[tab.stream_idx] = ("assistant", text)
+            if tab is self.active_tab():
+                if threading.current_thread() is threading.main_thread():
+                    self._paint_stream(tab)
+                else:
+                    self.after(0, self._paint_stream, tab)
+        else:
+            # nothing worth keeping — seal the (empty) entry, then explain
+            tab.stream_buf = ""
+            self._stream_end(tab)
+            if note:
+                self.append_chat(note, tag="system", tab=tab)
+
+    def _flush_stream(self, tab):
+        tab.stream_pending = False
+        if tab.stream_idx is None:
+            return
+        if tab is not self.active_tab():
+            return
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self._flush_stream, tab)
+            return
+        self._paint_stream(tab)
+
+    def _paint_stream(self, tab):
+        """Re-render only the live streaming entry (not the whole transcript)."""
+        if threading.current_thread() is not threading.main_thread():
+            self.after(0, self._paint_stream, tab)
+            return
+        tb = self.chat_display._textbox
+        if tab.stream_anchor is None:
+            # no anchor yet (fresh stream / after a tab switch): full render
+            # re-captures the anchor right before the live entry
+            self._render_transcript(tab)
+            return
+        self.chat_display.configure(state="normal")
+        try:
+            tb.delete(tab.stream_anchor, "end")
+        finally:
+            self.chat_display.configure(state="disabled")
+        try:
+            if tb.index("end-1c") != tab.stream_anchor:
+                # Tk silently dropped the delete (cross-thread / disabled
+                # widget) — appending again would duplicate the whole buffer,
+                # so fall back to a full re-render instead
+                self._render_transcript(tab)
+                return
+        except Exception:
+            pass
+        self._render_entry("assistant", tab.stream_buf or "")
+
+    def _stream_end(self, tab):
+        """Finalize the live entry (also called before any other append).
+
+        The stream state reset happens synchronously on the calling thread,
+        but the repaint is always marshalled to the main thread: this runs on
+        the engine worker thread, and a cross-thread delete against a text
+        widget that the other thread just disabled is silently dropped by Tk
+        (that duplication bug: every flush re-appended the full buffer).
+        """
+        if tab.stream_idx is None:
+            return
+        idx, anchor = tab.stream_idx, tab.stream_anchor
+        buf = (tab.stream_buf or "")
+        active = tab is self.active_tab()
+        empty = not buf.strip()
+        seq = getattr(tab, "render_seq", 0)
+        if empty and idx < len(tab.transcript):
+            del tab.transcript[idx]
+        tab.stream_buf = None
+        tab.stream_idx = None
+        tab.stream_anchor = None
+        tab.stream_pending = False
+        if not active:
+            return
+        if threading.current_thread() is threading.main_thread():
+            self._finalize_stream(tab, buf, anchor, empty, seq)
+        else:
+            self.after(0, self._finalize_stream, tab, buf, anchor, empty, seq)
+
+    def _finalize_stream(self, tab, buf, anchor, empty, seq):
+        """Main-thread repaint of a sealed streaming entry."""
+        if tab is not self.active_tab():
+            return
+        if seq != getattr(tab, "render_seq", 0):
+            # a full transcript re-render happened after this seal (e.g. a
+            # tab re-activation) and already painted the final text
+            return
+        if anchor is None:
+            if not empty:
+                self._render_entry("assistant", buf)
+            return
+        tb = self.chat_display._textbox
+        self.chat_display.configure(state="normal")
+        try:
+            tb.delete(anchor, "end")
+        finally:
+            self.chat_display.configure(state="disabled")
+        if not empty:
+            self._render_entry("assistant", buf)
 
     def _route_to_work_card(self, line, tab):
         """Send phase markers and step lines to the work card instead of chat."""
@@ -2630,6 +3696,19 @@ class MimoIDE(ctk.CTk):
     )
 
     def _classify_engine_line(self, line):
+        if line.startswith("@@USAGE@@"):
+            parts = line.split()
+            try:
+                pt = int(parts[1]); gt = int(parts[2])
+                tab = self.active_tab()
+                if tab:
+                    tab.last_prompt_tokens = pt
+                    tab.last_gen_tokens = gt
+                    tab.total_prompt_tokens = getattr(tab, "total_prompt_tokens", 0) + pt
+                    tab.total_gen_tokens = getattr(tab, "total_gen_tokens", 0) + gt
+            except (IndexError, ValueError):
+                pass
+            return "silent", line
         if line.startswith("✦") or line.startswith("◆"):
             body = re.sub(r"\[\d+/\d+\]\s*", "", line.lstrip("✦◆ ").strip())
             for key, label in self._PHASE_KEYWORDS:
@@ -2653,6 +3732,23 @@ class MimoIDE(ctk.CTk):
                                 "No saved session")):
             return "system", stripped
         return None, line
+
+    def _wait_for_ollama(self, tab, timeout=15):
+        host = self.settings.get("ollama_host") or "http://localhost:11434"
+        host = host.rstrip("/")
+        for attempt in range(timeout):
+            try:
+                import urllib.request
+                req = urllib.request.Request(f"{host}/api/tags", method="GET")
+                urllib.request.urlopen(req, timeout=2)
+                return True
+            except Exception:
+                if attempt == 0:
+                    self.append_chat(f"⏳ Waiting for Ollama at {host}…", tag="system", tab=tab)
+                time.sleep(1)
+        self.append_chat(f"❌ Ollama not reachable at {host} after {timeout}s. "
+                         f"Start it with: ollama serve", tag="error", tab=tab)
+        return False
 
     def agent_loop(self, tab, goal):
         visual_context = ""
@@ -2681,15 +3777,28 @@ class MimoIDE(ctk.CTk):
             self._finish_tab_run(tab)
             return
 
+        if not self._wait_for_ollama(tab):
+            self._finish_tab_run(tab)
+            return
+
         self.append_chat(f"◆ Engine ready · {tab.model} · plan → execute → verify → summarize",
                          tag="system", tab=tab)
-        cmd = [py, "-u", AGENT_SCRIPT, tab.root, "--model", tab.model, "--yolo", "--plan"]
+        cmd = [py, "-u", AGENT_SCRIPT, tab.root, "--model", tab.model, "--yolo", "--plan",
+               "--events"]
+        s = self.settings
+        if s.get("num_ctx"):
+            cmd += ["--num-ctx", str(int(s["num_ctx"]))]
+        if s.get("temperature") is not None:
+            cmd += ["--temperature", str(s["temperature"])]
+        if s.get("keep_alive"):
+            cmd += ["--keep-alive", str(s["keep_alive"])]
+        if s.get("num_predict"):
+            cmd += ["--num-predict", str(int(s["num_predict"]))]
         if tab.session_id:
             self.append_chat(f"↩ Resuming session {tab.session_id}", tag="system", tab=tab)
             cmd += ["--resume", tab.session_id]
         cmd += ["-p", full_goal]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
-        s = self.settings
         if s.get("ollama_host"):
             env["OLLAMA_HOST"] = s["ollama_host"]
         try:
@@ -2701,6 +3810,14 @@ class MimoIDE(ctk.CTk):
                     break
                 line = re.sub(r"\x1b\[[0-9;]*m", "", raw).rstrip()
                 if not line:
+                    continue
+                ev = _parse_event(line)
+                if ev is not None:
+                    try:
+                        self._handle_engine_event(ev, tab)
+                    except Exception as e:
+                        self.append_chat(f"⚠ Event handler error ({ev.get('evt')}): {e}",
+                                         tag="system", tab=tab)
                     continue
                 self.append_terminal(line, tab)
                 if line.startswith("@@TASKS@@"):
@@ -2714,6 +3831,7 @@ class MimoIDE(ctk.CTk):
                 tag, text = self._classify_engine_line(line)
                 if tag == "silent":
                     continue
+                self._track_context_file(line, tab)
                 self.append_chat(text, tag=tag, tab=tab)
             tab.proc.wait()
             if tab.stop_requested:
@@ -2769,22 +3887,33 @@ class MimoIDE(ctk.CTk):
         if tab is self.active_tab():
             self.after(0, self._sync_send_button)
         self.after(0, self.render_tab_bar)
+        if tab.inline_preview:
+            # ⌘K run finished → show the inline diff for Accept/Reject
+            self.after(0, lambda: self._review_inline_edit(tab))
 
     # -------------------------------------------------------- status --
     def _status_tick(self):
         tab = self.active_tab()
         if tab:
+            tok = ""
+            if tab.total_prompt_tokens or tab.total_gen_tokens:
+                tp = tab.total_prompt_tokens
+                tg = tab.total_gen_tokens
+                tok = f" · {tp // 1000}k in / {tg // 1000}k out" if (tp + tg) > 2000 else f" · {tp} in / {tg} out"
             if tab.is_generating:
                 elapsed = int(time.time() - tab.run_started) if tab.run_started else 0
                 queue = f" · queue {len(tab.pending_tasks)}" if tab.pending_tasks else ""
                 dots = "." * (int(time.time() * 2) % 4)
+                last = ""
+                if tab.last_prompt_tokens or tab.last_gen_tokens:
+                    last = f" · last {tab.last_prompt_tokens}+{tab.last_gen_tokens}"
                 self.status_bar.configure(
-                    text=f"● Running{dots} · {tab.name} · {tab.model} · {elapsed}s{queue}",
+                    text=f"● Running{dots} · {tab.name} · {tab.model} · {elapsed}s{queue}{last}{tok}",
                     text_color=GOLD)
             else:
                 n_sess = len(tab.session_labels)
                 self.status_bar.configure(
-                    text=f"○ idle · {tab.name} · {tab.model}"
+                    text=f"○ idle · {tab.name} · {tab.model}{tok}"
                          + (f" · {n_sess} session{'s' if n_sess != 1 else ''}" if n_sess else ""),
                     text_color=MUTED)
         self.after(900, self._status_tick)

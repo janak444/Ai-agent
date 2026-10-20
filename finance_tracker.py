@@ -10,48 +10,42 @@ class Transaction:
 class FinanceTracker:
     def __init__(self, filename='finance.json'):
         self.filename = filename
-        self.transactions = self.load_transactions()
+        self.transactions = []
+        self.load()
 
     def add_transaction(self, amount, category, description):
         self.transactions.append(Transaction(amount, category, description))
-        self.save_transactions()
+        self.save()
 
     def add_income(self, amount, category, description):
         self.transactions.append(Transaction(amount, category, description))
-        self.save_transactions()
+        self.save()
 
     def add_expense(self, amount, category, description):
         self.transactions.append(Transaction(-amount, category, description))
-        self.save_transactions()
+        self.save()
 
     def categorize(self, category):
         return [t for t in self.transactions if t.category == category]
 
     def generate_summary(self):
         total_balance = sum(t.amount for t in self.transactions)
-        spending_per_category = {}
-        for t in self.transactions:
-            category = t.category
-            if category in spending_per_category:
-                spending_per_category[category] += abs(t.amount)
-            else:
-                spending_per_category[category] = abs(t.amount)
+        spending_per_category = {t.category: sum(t.amount for t in self.transactions if t.category == t.category) for t in set(t.category for t in self.transactions)}
         return total_balance, spending_per_category
 
-    def save_transactions(self):
+    def save(self):
+        data = {'transactions': self.transactions}
         with open(self.filename, 'w') as f:
-            json.dump(self.transactions, f)
+            json.dump(data, f)
 
-    def load_transactions(self):
+    def load(self):
         if os.path.exists(self.filename):
             with open(self.filename, 'r') as f:
-                return json.load(f)
-        else:
-            return []
+                data = json.load(f)
+                self.transactions = data['transactions']
 
 def main():
     tracker = FinanceTracker()
-
     while True:
         print("1. Add transaction")
         print("2. Add income")
@@ -82,7 +76,7 @@ def main():
         elif choice == '5':
             break
         else:
-            print("Invalid choice. Please choose a valid option.")
+            print("Invalid choice")
 
 if __name__ == "__main__":
     main()
