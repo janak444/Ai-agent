@@ -5351,9 +5351,11 @@ class DevsoftIDE(ctk.CTk):
                 hint_url = preset.get("portal_url") or "https://console.groq.com/keys"
                 self.append_chat(
                     f"⚠️ Free API Key Needed for {cloud_provider.title()}:\n"
-                    f"1. Grab your free key at: {hint_url}\n"
-                    f"2. Click ⚙ Settings in the top bar, paste your key, and click Save.",
+                    f"1. Get your free key (no credit card required) at: {hint_url}\n"
+                    f"2. Paste it in the Settings window that just opened, and click Save Settings.\n"
+                    f"💡 Or switch the ◈ Brain dropdown to a local model (e.g. Qwen 3.8) to run offline without any API key.",
                     tag="error", tab=tab)
+                self.after(150, self._open_settings)
                 self._finish_tab_run(tab)
                 return
         else:
