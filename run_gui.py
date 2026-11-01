@@ -4596,8 +4596,9 @@ class DevsoftIDE(ctk.CTk):
         """
         t = ev["evt"]
         if t == "error":
-            msg = ev.get("message") or ev.get("error") or "Engine error"
-            self.append_chat(f"❌ {msg}", tag="error", tab=tab)
+            msg = ev.get("msg") or ev.get("message") or ev.get("error") or "Engine error"
+            clean_msg = msg.strip().lstrip("❌ ").strip()
+            self.append_chat(clean_msg, tag="error", tab=tab)
             return
         if t == "intent":
             it = ev.get("intent") or ""
@@ -5393,7 +5394,7 @@ class DevsoftIDE(ctk.CTk):
             cmd += ["--temperature", str(s["temperature"])]
         if s.get("keep_alive"):
             cmd += ["--keep-alive", str(s["keep_alive"])]
-        if s.get("num_predict"):
+        if s.get("num_predict") and int(s["num_predict"]) > 0:
             cmd += ["--num-predict", str(int(s["num_predict"]))]
         if s.get("think"):
             cmd += ["--think"]
