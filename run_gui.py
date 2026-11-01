@@ -77,9 +77,9 @@ _migrate_legacy_files()
 
 FREE_CLOUD_MODELS = {
     # Groq (Free Tier: 300 - 500+ tok/s, ultra-fast LPU inference, 0 cost)
-    "groq:llama-3.3-70b-versatile": "⚡ Groq: Llama 3.3 70B (Free · Ultra Fast)",
-    "groq:qwen-2.5-coder-32b": "⚡ Groq: Qwen 2.5 Coder 32B (Free · Coding)",
-    "groq:llama-3.1-8b-instant": "⚡ Groq: Llama 3.1 8B (Free · 500+ tok/s)",
+    "groq:qwen/qwen3.8-27b": "⚡ Groq: Qwen 3.8 27B (Free · Ultra Fast)",
+    "groq:openai/gpt-oss-120b": "⚡ Groq: GPT-OSS 120B (Free · Reasoning)",
+    "groq:openai/gpt-oss-20b": "⚡ Groq: GPT-OSS 20B (Free · Fast)",
     # OpenRouter (Permanent Free Tier Models)
     "openrouter:meta-llama/llama-3.3-70b-instruct:free": "⚡ OpenRouter: Llama 3.3 70B (Free)",
     "openrouter:qwen/qwen-2.5-coder-32b-instruct:free": "⚡ OpenRouter: Qwen 2.5 Coder (Free)",
@@ -389,7 +389,7 @@ class ProjectTab:
     def __init__(self, root):
         self.root = os.path.abspath(root)
         self.name = os.path.basename(self.root.rstrip("/")) or self.root
-        self.model = "groq:llama-3.3-70b-versatile"
+        self.model = "groq:qwen/qwen3.8-27b"
         self.session_id = None
         self.session_labels = {}
         self.transcript = []
