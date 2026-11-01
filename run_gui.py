@@ -10,6 +10,7 @@ import base64
 import bisect
 import difflib
 import hashlib
+import collections
 
 try:
     import customtkinter as ctk
@@ -74,10 +75,74 @@ def _migrate_legacy_files():
 
 _migrate_legacy_files()
 
+FREE_CLOUD_MODELS = {
+    # Groq (Free Tier: 300 - 500+ tok/s, ultra-fast LPU inference, 0 cost)
+    "groq:llama-3.3-70b-versatile": "⚡ Groq: Llama 3.3 70B (Free · Ultra Fast)",
+    "groq:qwen-2.5-coder-32b": "⚡ Groq: Qwen 2.5 Coder 32B (Free · Coding)",
+    "groq:llama-3.1-8b-instant": "⚡ Groq: Llama 3.1 8B (Free · 500+ tok/s)",
+    # OpenRouter (Permanent Free Tier Models)
+    "openrouter:meta-llama/llama-3.3-70b-instruct:free": "⚡ OpenRouter: Llama 3.3 70B (Free)",
+    "openrouter:qwen/qwen-2.5-coder-32b-instruct:free": "⚡ OpenRouter: Qwen 2.5 Coder (Free)",
+    "openrouter:deepseek/deepseek-r1:free": "⚡ OpenRouter: DeepSeek R1 (Free)",
+    # Google Gemini (Google AI Studio Free Tier: 15 RPM, 1M context window)
+    "gemini:gemini-2.0-flash": "⚡ Gemini 2.0 Flash (Free · Google AI)",
+    "gemini:gemini-1.5-flash": "⚡ Gemini 1.5 Flash (Free · Google AI)",
+    # Cerebras (Free Tier: 1M tokens/day at 1000+ tok/s)
+    "cerebras:llama3.1-70b": "⚡ Cerebras: Llama 3.1 70B (Free · 1000 tok/s)",
+}
+
+CLOUD_PRESETS = {
+    "groq": {
+        "label": "⚡ Groq (Free · Ultra Fast LPU)",
+        "provider": "groq",
+        "base_url": "https://api.groq.com/openai/v1",
+        "key_setting": "groq_api_key",
+        "env_var": "GROQ_API_KEY",
+        "portal_url": "https://console.groq.com/keys",
+    },
+    "openrouter": {
+        "label": "⚡ OpenRouter (Free Models)",
+        "provider": "openrouter",
+        "base_url": "https://openrouter.ai/api/v1",
+        "key_setting": "openrouter_api_key",
+        "env_var": "OPENROUTER_API_KEY",
+        "portal_url": "https://openrouter.ai/keys",
+    },
+    "gemini": {
+        "label": "⚡ Google Gemini (Free AI Studio)",
+        "provider": "gemini",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai",
+        "key_setting": "gemini_api_key",
+        "env_var": "GEMINI_API_KEY",
+        "portal_url": "https://aistudio.google.com/apikey",
+    },
+    "cerebras": {
+        "label": "⚡ Cerebras (Free 1M tok/day)",
+        "provider": "cerebras",
+        "base_url": "https://api.cerebras.ai/v1",
+        "key_setting": "cerebras_api_key",
+        "env_var": "CEREBRAS_API_KEY",
+        "portal_url": "https://cloud.cerebras.ai",
+    },
+    "ollama": {
+        "label": "💻 Ollama (Local Offline)",
+        "provider": "ollama",
+        "base_url": "http://127.0.0.1:11434",
+        "key_setting": "",
+        "env_var": "",
+        "portal_url": "https://ollama.com",
+    },
+}
+
 DEFAULT_SETTINGS = {
     "ollama_host": "http://127.0.0.1:11434",
-    "provider": "ollama",
+    "provider": "groq",
+    "cloud_base_url": "https://api.groq.com/openai/v1",
     "api_key": "",
+    "groq_api_key": "",
+    "openrouter_api_key": "",
+    "gemini_api_key": "",
+    "cerebras_api_key": "",
     "num_ctx": 16384,
     "temperature": 0.2,
     "keep_alive": "60m",
@@ -114,19 +179,50 @@ _agent_py_lock = threading.Lock()
 
 
 def _find_agent_python():
-    candidates = [os.environ.get("DEVSOFT_AGENT_PY"), os.environ.get("MIMO_AGENT_PY"),
-                  sys.executable,
-                  shutil.which("python3"), shutil.which("python")]
+    candidates = [
+        os.environ.get("DEVSOFT_AGENT_PY"),
+        os.environ.get("MIMO_AGENT_PY"),
+        os.path.join(os.getcwd(), "agent-env", "bin", "python3"),
+        sys.executable,
+        shutil.which("python3"),
+        shutil.which("python"),
+    ]
+    # Priority 1: has httpx (required for Cloud and OmniRoute)
     for cand in candidates:
         if not cand:
             continue
+        cand = os.path.expanduser(cand)
+        if not os.path.isfile(cand):
+            continue
         try:
-            r = subprocess.run([cand, "-c", "import ollama"], capture_output=True, timeout=20)
+            r = subprocess.run([cand, "-c", "import httpx"], capture_output=True, timeout=5)
             if r.returncode == 0:
                 return cand
-        except (OSError, subprocess.TimeoutExpired):
+        except Exception:
+            pass
+
+    # Priority 2: has ollama
+    for cand in candidates:
+        if not cand:
             continue
-    return None
+        cand = os.path.expanduser(cand)
+        if not os.path.isfile(cand):
+            continue
+        try:
+            r = subprocess.run([cand, "-c", "import ollama"], capture_output=True, timeout=5)
+            if r.returncode == 0:
+                return cand
+        except Exception:
+            pass
+
+    # Fallback to working python interpreter
+    for cand in candidates:
+        if not cand:
+            continue
+        cand = os.path.expanduser(cand)
+        if os.path.isfile(cand):
+            return cand
+    return sys.executable or shutil.which("python3")
 
 
 def get_agent_python():
@@ -293,7 +389,7 @@ class ProjectTab:
     def __init__(self, root):
         self.root = os.path.abspath(root)
         self.name = os.path.basename(self.root.rstrip("/")) or self.root
-        self.model = "qwen3.8:27b-mtp-q4_K_M"
+        self.model = "groq:llama-3.3-70b-versatile"
         self.session_id = None
         self.session_labels = {}
         self.transcript = []
@@ -333,6 +429,10 @@ class ProjectTab:
         self.execution_mode = "fast"   # "fast" (direct tool execution) or "architect" (full mission)
         self.prompt_history = []
         self.history_index = -1
+        self.expanded_dirs = set()
+        self._initial_dirs_expanded = False
+        self.sidebar_view = "files"
+        self.recent_tool_calls = []
         self.thinking_buf = []
         # live assistant streaming (JSONL delta events from the engine)
         self.stream_buf = None
@@ -368,9 +468,10 @@ class DevsoftIDE(ctk.CTk):
         self.ram_gb = _detect_ram_gb()
         ctk.set_appearance_mode(self.settings.get("theme", "dark").capitalize())
         self.models_inventory = {
-            "qwen3.8:27b-mtp-q4_K_M": "Qwen 3.8 27B (fast)",
-            "qwen3.8:27b": "Qwen 3.8 (27B)",
-            "qwen3-coder:30b": "Qwen 3 Coder (30B)",
+            **FREE_CLOUD_MODELS,
+            "qwen3.8:27b-mtp-q4_K_M": "Qwen 3.8 27B (local)",
+            "qwen3.8:27b": "Qwen 3.8 (27B local)",
+            "qwen3-coder:30b": "Qwen 3 Coder (30B local)",
             "llava:latest": "LLaVA (vision)",
         }
         self.models_meta = {}
@@ -432,56 +533,147 @@ class DevsoftIDE(ctk.CTk):
         # --- sidebar ---
         self.sidebar = ctk.CTkFrame(self, width=280, corner_radius=0, fg_color=PANEL)
         self.sidebar.grid(row=1, column=0, sticky="nsew")
-        self.sidebar.grid_rowconfigure(7, weight=1)
-        self.sidebar.grid_rowconfigure(11, weight=2)
+        self.sidebar.grid_rowconfigure(3, weight=1)
         self.sidebar.grid_columnconfigure(0, weight=1)
 
+        # Row 0: Project header
         self.project_label = ctk.CTkLabel(self.sidebar, text="PROJECT", text_color=GOLD,
                                           font=ctk.CTkFont(size=13, weight="bold"))
-        self.project_label.grid(row=0, column=0, padx=18, pady=(16, 0), sticky="w")
+        self.project_label.grid(row=0, column=0, padx=16, pady=(14, 0), sticky="w")
         self.project_path_label = ctk.CTkLabel(self.sidebar, text="", text_color="#666",
                                                font=ctk.CTkFont(size=10), anchor="w")
-        self.project_path_label.grid(row=0, column=0, padx=18, pady=(34, 0), sticky="w")
+        self.project_path_label.grid(row=0, column=0, padx=16, pady=(32, 0), sticky="w")
 
-        ctk.CTkLabel(self.sidebar, text="◈ Brain", text_color=MUTED,
-                     font=ctk.CTkFont(size=11, weight="bold")
-                     ).grid(row=1, column=0, padx=18, pady=(14, 0), sticky="w")
+        # Row 1: Brain selector
+        brain_bar = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        brain_bar.grid(row=1, column=0, padx=12, pady=(10, 4), sticky="ew")
+        brain_bar.grid_columnconfigure(1, weight=1)
+        ctk.CTkLabel(brain_bar, text="◈ Brain:", text_color=MUTED,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, padx=(4, 6), sticky="w")
         self.model_dropdown = ctk.CTkOptionMenu(
-            self.sidebar, values=list(self.models_inventory.values()),
+            brain_bar, values=list(self.models_inventory.values()),
             command=self.change_model, fg_color=ACTIVE, button_color=GOLD,
             button_hover_color="#FFB300", text_color=TEXT, dropdown_fg_color=CARD,
-            dropdown_text_color=TEXT, height=34)
-        self.model_dropdown.grid(row=2, column=0, padx=14, pady=(6, 4), sticky="ew")
+            dropdown_text_color=TEXT, height=28)
+        self.model_dropdown.grid(row=0, column=1, sticky="ew")
 
-        ctk.CTkLabel(self.sidebar, text="◈ Sessions", text_color=MUTED,
-                     font=ctk.CTkFont(size=11, weight="bold")
-                     ).grid(row=3, column=0, padx=18, pady=(10, 0), sticky="w")
-        row4 = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        row4.grid(row=4, column=0, padx=14, pady=(6, 4), sticky="ew")
-        row4.grid_columnconfigure(0, weight=1)
+        # Row 2: Segmented View Switcher: Files | Chats | Tasks
+        self.sidebar_view_bar = ctk.CTkSegmentedButton(
+            self.sidebar,
+            values=["📁 Files", "💬 Chats", "✓ Tasks"],
+            command=self._on_sidebar_view_change,
+            fg_color="#0D1117",
+            selected_color=ACTIVE,
+            selected_hover_color="#1F2E47",
+            unselected_color="#0D1117",
+            unselected_hover_color=CARD,
+            text_color=TEXT,
+            height=28
+        )
+        self.sidebar_view_bar.grid(row=2, column=0, padx=12, pady=(6, 4), sticky="ew")
+        self.sidebar_view_bar.set("📁 Files")
+
+        # Hidden backwards-compatibility dropdown for sessions
         self.sessions_dropdown = ctk.CTkOptionMenu(
-            row4, values=["(new chat)"], command=self.on_session_selected,
-            fg_color=ACTIVE, button_color=GOLD, button_hover_color="#FFB300",
-            text_color=TEXT, dropdown_fg_color=CARD, dropdown_text_color=TEXT,
-            height=34, dynamic_resizing=False, width=170)
-        self.sessions_dropdown.grid(row=0, column=0, sticky="ew")
-        self.new_chat_btn = ctk.CTkButton(row4, text="＋", width=34, height=34,
-                                          fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
-                                          font=ctk.CTkFont(size=15, weight="bold"),
-                                          command=self.new_chat)
-        self.new_chat_btn.grid(row=0, column=1, padx=(6, 0))
-        Tooltip(self.new_chat_btn, "New chat  (⌘N)")
-        self.sess_ops_btn = ctk.CTkButton(row4, text="⋯", width=34, height=34,
-                                          fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
-                                          font=ctk.CTkFont(size=14, weight="bold"),
-                                          command=self._open_session_ops)
-        self.sess_ops_btn.grid(row=0, column=2, padx=(4, 0))
-        Tooltip(self.sess_ops_btn, "Session options  (rename / delete / export)")
+            self.sidebar, values=["(new chat)"], command=self.on_session_selected,
+            height=0, width=0)
 
-        tasks_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        tasks_hdr.grid(row=5, column=0, padx=18, pady=(12, 0), sticky="ew")
+        # Row 3 container: 3 view frames (Files, Chats, Tasks)
+
+        # 1. Files frame (VS Code Explorer)
+        self.sidebar_files_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.sidebar_files_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
+        self.sidebar_files_frame.grid_columnconfigure(0, weight=1)
+        self.sidebar_files_frame.grid_rowconfigure(2, weight=1)
+
+        files_hdr = ctk.CTkFrame(self.sidebar_files_frame, fg_color="transparent")
+        files_hdr.grid(row=0, column=0, sticky="ew", pady=(2, 2))
+        files_hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(files_hdr, text="◈ EXPLORER", text_color=GOLD,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.new_file_btn = ctk.CTkButton(files_hdr, text="+", width=22, height=22,
+                                          fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
+                                          font=ctk.CTkFont(size=13, weight="bold"),
+                                          command=self._new_file_dialog)
+        self.new_file_btn.grid(row=0, column=1, padx=(2, 0))
+        Tooltip(self.new_file_btn, "New File")
+        self.new_folder_btn = ctk.CTkButton(files_hdr, text="📁+", width=26, height=22,
+                                            fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                            font=ctk.CTkFont(size=10),
+                                            command=self._new_folder_dialog)
+        self.new_folder_btn.grid(row=0, column=2, padx=(2, 0))
+        Tooltip(self.new_folder_btn, "New Folder")
+        self.expand_all_btn = ctk.CTkButton(files_hdr, text="⤢", width=22, height=22,
+                                            fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                            font=ctk.CTkFont(size=11),
+                                            command=lambda: self._expand_all_dirs(self.active_tab()))
+        self.expand_all_btn.grid(row=0, column=3, padx=(2, 0))
+        Tooltip(self.expand_all_btn, "Expand All")
+        self.collapse_all_btn = ctk.CTkButton(files_hdr, text="⤡", width=22, height=22,
+                                              fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                              font=ctk.CTkFont(size=11),
+                                              command=lambda: self._collapse_all_dirs(self.active_tab()))
+        self.collapse_all_btn.grid(row=0, column=4, padx=(2, 0))
+        Tooltip(self.collapse_all_btn, "Collapse All")
+        self.search_btn = ctk.CTkButton(files_hdr, text="⌕", width=22, height=22,
+                                        fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
+                                        font=ctk.CTkFont(size=12, weight="bold"),
+                                        command=self._open_search_panel)
+        self.search_btn.grid(row=0, column=5, padx=(2, 0))
+        Tooltip(self.search_btn, "Search in Project")
+        self.refresh_files_btn = ctk.CTkButton(files_hdr, text="⟳", width=22, height=22,
+                                               fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
+                                               font=ctk.CTkFont(size=11),
+                                               command=lambda: self._render_files(self.active_tab()))
+        self.refresh_files_btn.grid(row=0, column=6, padx=(2, 0))
+        Tooltip(self.refresh_files_btn, "Refresh")
+
+        self.files_filter = ctk.CTkEntry(self.sidebar_files_frame, height=26, fg_color=CARD,
+                                         placeholder_text="Filter files…",
+                                         placeholder_text_color="#666", border_color=ACTIVE,
+                                         text_color=TEXT)
+        self.files_filter.grid(row=1, column=0, sticky="ew", pady=(4, 4))
+        self.files_filter.bind("<KeyRelease>", self._on_files_filter)
+
+        self.files_container = ctk.CTkScrollableFrame(self.sidebar_files_frame, fg_color=PANEL)
+        self.files_container.grid(row=2, column=0, sticky="nsew", pady=(0, 2))
+
+        # 2. Sessions frame (Antigravity Chat Sessions)
+        self.sidebar_sessions_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.sidebar_sessions_frame.grid_columnconfigure(0, weight=1)
+        self.sidebar_sessions_frame.grid_rowconfigure(2, weight=1)
+
+        sess_hdr = ctk.CTkFrame(self.sidebar_sessions_frame, fg_color="transparent")
+        sess_hdr.grid(row=0, column=0, sticky="ew", pady=(2, 2))
+        sess_hdr.grid_columnconfigure(0, weight=1)
+        ctk.CTkLabel(sess_hdr, text="◈ CHAT SESSIONS", text_color=GOLD,
+                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w")
+        self.new_chat_btn = ctk.CTkButton(sess_hdr, text="＋ New", width=64, height=22,
+                                          fg_color=GOLD, hover_color="#FFB300", text_color="#000",
+                                          font=ctk.CTkFont(size=11, weight="bold"),
+                                          command=self.new_chat)
+        self.new_chat_btn.grid(row=0, column=1)
+        Tooltip(self.new_chat_btn, "Start New Chat (⌘N)")
+
+        self.sessions_filter = ctk.CTkEntry(self.sidebar_sessions_frame, height=26, fg_color=CARD,
+                                            placeholder_text="Search chats…",
+                                            placeholder_text_color="#666", border_color=ACTIVE,
+                                            text_color=TEXT)
+        self.sessions_filter.grid(row=1, column=0, sticky="ew", pady=(4, 4))
+        self.sessions_filter.bind("<KeyRelease>", lambda _e: self._render_sessions_list(self.active_tab()))
+
+        self.sessions_container = ctk.CTkScrollableFrame(self.sidebar_sessions_frame, fg_color=PANEL)
+        self.sessions_container.grid(row=2, column=0, sticky="nsew", pady=(0, 2))
+
+        # 3. Tasks frame
+        self.sidebar_tasks_frame = ctk.CTkFrame(self.sidebar, fg_color="transparent")
+        self.sidebar_tasks_frame.grid_columnconfigure(0, weight=1)
+        self.sidebar_tasks_frame.grid_rowconfigure(1, weight=1)
+
+        tasks_hdr = ctk.CTkFrame(self.sidebar_tasks_frame, fg_color="transparent")
+        tasks_hdr.grid(row=0, column=0, sticky="ew", pady=(2, 2))
         tasks_hdr.grid_columnconfigure(0, weight=1)
-        self.tasks_label = ctk.CTkLabel(tasks_hdr, text="◈ Tasks", text_color=MUTED,
+        self.tasks_label = ctk.CTkLabel(tasks_hdr, text="◈ TASKS", text_color=GOLD,
                                         font=ctk.CTkFont(size=11, weight="bold"))
         self.tasks_label.grid(row=0, column=0, sticky="w")
         self.tasks_expand_btn = ctk.CTkButton(tasks_hdr, text="⤢", width=30, height=22,
@@ -489,47 +681,9 @@ class DevsoftIDE(ctk.CTk):
                                               font=ctk.CTkFont(size=13),
                                               command=self._open_tasks_expanded)
         self.tasks_expand_btn.grid(row=0, column=1, padx=(6, 0))
-        self.tasks_container = ctk.CTkScrollableFrame(self.sidebar, width=240,
-                                                      fg_color=PANEL, label_text="")
-        self.tasks_container.grid(row=7, column=0, padx=10, pady=(6, 4), sticky="nsew")
 
-        files_hdr = ctk.CTkFrame(self.sidebar, fg_color="transparent")
-        files_hdr.grid(row=8, column=0, padx=14, pady=(10, 0), sticky="ew")
-        files_hdr.grid_columnconfigure(0, weight=1)
-        ctk.CTkLabel(files_hdr, text="◈ Files", text_color=MUTED,
-                     font=ctk.CTkFont(size=11, weight="bold")).grid(row=0, column=0, sticky="w")
-        self.new_file_btn = ctk.CTkButton(files_hdr, text="+", width=24, height=22,
-                                          fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
-                                          font=ctk.CTkFont(size=13, weight="bold"),
-                                          command=self._new_file_dialog)
-        self.new_file_btn.grid(row=0, column=1, padx=(2, 0))
-        Tooltip(self.new_file_btn, "Create new file")
-        self.new_folder_btn = ctk.CTkButton(files_hdr, text="📁+", width=28, height=22,
-                                            fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
-                                            font=ctk.CTkFont(size=11),
-                                            command=self._new_folder_dialog)
-        self.new_folder_btn.grid(row=0, column=2, padx=(2, 0))
-        Tooltip(self.new_folder_btn, "Create new folder")
-        self.search_btn = ctk.CTkButton(files_hdr, text="⌕", width=24, height=22,
-                                        fg_color=CARD, hover_color=ACTIVE, text_color=GOLD,
-                                        font=ctk.CTkFont(size=13, weight="bold"),
-                                        command=self._open_search_panel)
-        self.search_btn.grid(row=0, column=3, padx=(2, 0))
-        Tooltip(self.search_btn, "Search in project  (⌘⇧F)")
-        self.refresh_files_btn = ctk.CTkButton(files_hdr, text="⟳", width=24, height=22,
-                                               fg_color=CARD, hover_color=ACTIVE, text_color=MUTED,
-                                               font=ctk.CTkFont(size=11),
-                                               command=lambda: self._render_files(self.active_tab()))
-        self.refresh_files_btn.grid(row=0, column=4, padx=(2, 0))
-        Tooltip(self.refresh_files_btn, "Refresh file tree")
-        self.files_filter = ctk.CTkEntry(self.sidebar, height=28, fg_color=CARD,
-                                         placeholder_text="Filter files…",
-                                         placeholder_text_color="#666", border_color=ACTIVE,
-                                         text_color=TEXT)
-        self.files_filter.grid(row=9, column=0, padx=14, pady=(6, 2), sticky="ew")
-        self.files_filter.bind("<KeyRelease>", self._on_files_filter)
-        self.files_container = ctk.CTkScrollableFrame(self.sidebar, width=240, fg_color=PANEL)
-        self.files_container.grid(row=11, column=0, padx=10, pady=(2, 10), sticky="nsew")
+        self.tasks_container = ctk.CTkScrollableFrame(self.sidebar_tasks_frame, fg_color=PANEL)
+        self.tasks_container.grid(row=1, column=0, sticky="nsew", pady=(0, 2))
 
         # --- main area ---
         self.main = ctk.CTkFrame(self, fg_color=BG, corner_radius=0)
@@ -1050,6 +1204,7 @@ class DevsoftIDE(ctk.CTk):
                                           height=26, anchor="e", fg_color="transparent",
                                           text_color="#555", font=ctk.CTkFont(size=10), padx=14)
         self.shortcut_hint.grid(row=0, column=1, sticky="e")
+        self._show_sidebar_files()
 
     def _build_welcome(self):
         inner = ctk.CTkFrame(self.welcome_frame, fg_color="transparent")
@@ -1413,30 +1568,120 @@ class DevsoftIDE(ctk.CTk):
         self.append_chat(f"🎨 Theme: {new}", tag="system")
 
     def _open_settings(self):
+        import webbrowser
         win = ctk.CTkToplevel(self)
         win.title("Settings")
-        win.geometry("520x520")
+        win.geometry("560x680")
         win.configure(fg_color=BG)
         win.transient(self)
         win.lift()
         win.focus_force()
-        ctk.CTkLabel(win, text="⚙ Settings", text_color=GOLD,
-                     font=ctk.CTkFont(size=16, weight="bold")).pack(anchor="w", padx=18, pady=(16, 12))
+        ctk.CTkLabel(win, text="⚙ Devsoft Settings", text_color=GOLD,
+                     font=ctk.CTkFont(size=17, weight="bold")).pack(anchor="w", padx=18, pady=(16, 10))
         form = ctk.CTkScrollableFrame(win, fg_color=PANEL)
         form.pack(fill="both", expand=True, padx=14, pady=4)
 
         s = self.settings
         entries = {}
 
-        def add_row(label, key, tip=""):
-            row = ctk.CTkFrame(form, fg_color="transparent")
-            row.pack(fill="x", padx=8, pady=6)
+        # --- Section 1: Cloud Providers (Free & Fast) ---
+        cloud_card = ctk.CTkFrame(form, fg_color=CARD, corner_radius=8)
+        cloud_card.pack(fill="x", padx=6, pady=8)
+        ctk.CTkLabel(cloud_card, text="☁ Cloud AI Providers (Free & Ultra Fast)",
+                     text_color=GOLD, font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(10, 4))
+        ctk.CTkLabel(cloud_card,
+                     text="Free cloud models respond in milliseconds with no local GPU/RAM required.",
+                     text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(0, 8))
+
+        preset_labels = [
+            "⚡ Groq (Free · Ultra Fast 300-500 tok/s)",
+            "⚡ OpenRouter (Free Tier Models)",
+            "⚡ Google Gemini (Free AI Studio)",
+            "⚡ Cerebras (Free 1M tok/day)",
+            "💻 Ollama (Local Offline)",
+            "🌐 Custom OpenAI-compatible",
+        ]
+        preset_map = {
+            "⚡ Groq (Free · Ultra Fast 300-500 tok/s)": "groq",
+            "⚡ OpenRouter (Free Tier Models)": "openrouter",
+            "⚡ Google Gemini (Free AI Studio)": "gemini",
+            "⚡ Cerebras (Free 1M tok/day)": "cerebras",
+            "💻 Ollama (Local Offline)": "ollama",
+            "🌐 Custom OpenAI-compatible": "cloud",
+        }
+        rev_preset_map = {v: k for k, v in preset_map.items()}
+
+        current_prov = s.get("provider", "groq")
+        curr_preset_label = rev_preset_map.get(current_prov, preset_labels[0])
+
+        p_row = ctk.CTkFrame(cloud_card, fg_color="transparent")
+        p_row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(p_row, text="Active Provider:", text_color=TEXT,
+                     font=ctk.CTkFont(size=11, weight="bold")).pack(side="left")
+
+        url_entry = ctk.CTkEntry(cloud_card, height=28, fg_color="#10141A", border_color=ACTIVE, text_color=TEXT)
+
+        def on_preset_select(choice):
+            prov = preset_map.get(choice, "groq")
+            if prov in CLOUD_PRESETS:
+                url_entry.delete(0, "end")
+                url_entry.insert(0, CLOUD_PRESETS[prov]["base_url"])
+
+        preset_menu = ctk.CTkOptionMenu(
+            p_row, values=preset_labels, command=on_preset_select,
+            fg_color=ACTIVE, button_color=GOLD, text_color=TEXT, dropdown_fg_color=CARD,
+            height=28, width=280)
+        preset_menu.set(curr_preset_label)
+        preset_menu.pack(side="right")
+
+        u_row = ctk.CTkFrame(cloud_card, fg_color="transparent")
+        u_row.pack(fill="x", padx=12, pady=4)
+        ctk.CTkLabel(u_row, text="Cloud Base URL:", text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w")
+        url_entry.insert(0, str(s.get("cloud_base_url", "https://api.groq.com/openai/v1")))
+        url_entry.pack(fill="x", padx=12, pady=(2, 8))
+        entries["cloud_base_url"] = ("entry", url_entry)
+
+        # Provider API Key fields with clickable links
+        def add_key_field(parent, label, key_name, portal_url):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=3)
+            hdr = ctk.CTkFrame(row, fg_color="transparent")
+            hdr.pack(fill="x")
+            ctk.CTkLabel(hdr, text=label, text_color=TEXT, font=ctk.CTkFont(size=11)).pack(side="left")
+            if portal_url:
+                link_btn = ctk.CTkButton(
+                    hdr, text="Get Free Key ↗", width=85, height=20, fg_color="#1E2A3A",
+                    hover_color=ACTIVE, text_color=GOLD, font=ctk.CTkFont(size=10, weight="bold"),
+                    command=lambda: webbrowser.open(portal_url))
+                link_btn.pack(side="right")
+            e = ctk.CTkEntry(row, height=28, fg_color="#10141A", border_color=ACTIVE, text_color=TEXT, show="*")
+            val = s.get(key_name, "")
+            if val:
+                e.insert(0, str(val))
+            e.pack(fill="x", pady=(2, 4))
+            entries[key_name] = ("entry", e)
+
+        add_key_field(cloud_card, "Groq API Key (300+ tok/s free)", "groq_api_key", "https://console.groq.com/keys")
+        add_key_field(cloud_card, "OpenRouter API Key (Free tier models)", "openrouter_api_key", "https://openrouter.ai/keys")
+        add_key_field(cloud_card, "Google Gemini API Key (AI Studio 15 RPM)", "gemini_api_key", "https://aistudio.google.com/apikey")
+        add_key_field(cloud_card, "Cerebras API Key (1,000 tok/s free)", "cerebras_api_key", "https://cloud.cerebras.ai")
+        add_key_field(cloud_card, "Custom / Other API Key", "api_key", "")
+
+        # --- Section 2: Local & Engine Options ---
+        eng_card = ctk.CTkFrame(form, fg_color=CARD, corner_radius=8)
+        eng_card.pack(fill="x", padx=6, pady=8)
+        ctk.CTkLabel(eng_card, text="⚙ Engine & Execution Options",
+                     text_color=GOLD, font=ctk.CTkFont(size=13, weight="bold")).pack(anchor="w", padx=12, pady=(10, 6))
+
+        def add_row(parent, label, key, tip=""):
+            row = ctk.CTkFrame(parent, fg_color="transparent")
+            row.pack(fill="x", padx=12, pady=5)
             ctk.CTkLabel(row, text=label, text_color=TEXT,
-                         font=ctk.CTkFont(size=12), anchor="w").pack(anchor="w")
+                         font=ctk.CTkFont(size=11), anchor="w").pack(anchor="w")
             if tip:
-                ctk.CTkLabel(row, text=tip, text_color="#666",
+                ctk.CTkLabel(row, text=tip, text_color=MUTED,
                              font=ctk.CTkFont(size=10), anchor="w").pack(anchor="w")
-            val = s.get(key, DEFAULT_SETTINGS[key])
+            val = s.get(key, DEFAULT_SETTINGS.get(key, ""))
             if isinstance(val, bool):
                 w = ctk.CTkSwitch(row, text="enabled" if val else "disabled",
                                   variable=ctk.BooleanVar(value=val),
@@ -1444,39 +1689,37 @@ class DevsoftIDE(ctk.CTk):
                 w.pack(anchor="w", pady=(2, 0))
                 entries[key] = ("switch", w)
             else:
-                e = ctk.CTkEntry(row, height=30, fg_color=CARD, border_color=ACTIVE,
+                e = ctk.CTkEntry(row, height=28, fg_color="#10141A", border_color=ACTIVE,
                                  text_color=TEXT)
                 e.insert(0, str(val))
                 e.pack(fill="x", pady=(2, 0))
                 entries[key] = ("entry", e)
 
-        add_row("Provider", "provider", "ollama, omniroute, generic_cloud, or both")
-        add_row("Cloud Base URL", "cloud_base_url", "e.g., https://api.freellmapi.com/v1")
-        add_row("API Key", "api_key", "Your cloud API key")
-        add_row("Ollama host", "ollama_host", "Where your Ollama server runs")
-        add_row("Context window (num_ctx)", "num_ctx", "Larger = more memory, better long files")
-        add_row("Temperature", "temperature", "Lower = more deterministic code")
-        add_row("Keep-alive", "keep_alive", "How long the model stays loaded (e.g. 30m)")
-        add_row("Max output tokens", "num_predict", "-1 = unlimited")
-        add_row("Model thinking mode", "think",
-                "Reasoning before answering — higher quality, much slower (off = fastest)")
-        add_row("Auto-approve actions", "auto_approve", "Skip per-command confirmation")
+        add_row(eng_card, "Ollama host (Local)", "ollama_host", "Where your Ollama server runs (default: http://127.0.0.1:11434)")
+        add_row(eng_card, "Context window (num_ctx)", "num_ctx", "Larger = more memory, better long files (e.g. 16384)")
+        add_row(eng_card, "Temperature", "temperature", "Lower = more deterministic code (default: 0.2)")
+        add_row(eng_card, "Model thinking mode", "think",
+                "Deep reasoning before answering (off = fastest answers)")
+        add_row(eng_card, "Auto-approve actions", "auto_approve", "Skip per-tool confirmation")
 
         if self.ram_gb:
-            ctk.CTkLabel(form, text=f"Detected RAM: {self.ram_gb:.0f} GB",
-                         text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=(8, 0))
+            ctk.CTkLabel(eng_card, text=f"Detected RAM: {self.ram_gb:.0f} GB",
+                         text_color=MUTED, font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=(6, 0))
             tip = self._ram_model_tip(self.ram_gb)
             if tip:
-                ctk.CTkLabel(form, text=tip, text_color=BLUE, font=ctk.CTkFont(size=11),
-                             wraplength=440, justify="left").pack(anchor="w", padx=8, pady=(2, 0))
+                ctk.CTkLabel(eng_card, text=tip, text_color=BLUE, font=ctk.CTkFont(size=11),
+                             wraplength=440, justify="left").pack(anchor="w", padx=12, pady=(2, 10))
 
         def save():
+            selected_choice = preset_menu.get()
+            chosen_prov = preset_map.get(selected_choice, "groq")
+            s["provider"] = chosen_prov
             for key, (kind, w) in entries.items():
                 if kind == "switch":
                     s[key] = bool(w.get())
                 else:
                     raw = w.get().strip()
-                    old = s.get(key, DEFAULT_SETTINGS[key])
+                    old = s.get(key, DEFAULT_SETTINGS.get(key, ""))
                     if isinstance(old, bool):
                         s[key] = raw.lower() in ("1", "true", "yes", "on")
                     elif isinstance(old, int):
@@ -1493,11 +1736,12 @@ class DevsoftIDE(ctk.CTk):
                         s[key] = raw
             _save_settings(s)
             win.destroy()
-            self.append_chat("⚙ Settings saved.", tag="success")
+            self.append_chat(f"⚙ Settings saved · Active provider: {chosen_prov.title()}", tag="success")
+            self.refresh_available_models()
 
-        ctk.CTkButton(win, text="Save", height=36, fg_color=GOLD, text_color="#000",
+        ctk.CTkButton(win, text="Save Settings", height=36, fg_color=GOLD, text_color="#000",
                       hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
-                      command=save).pack(fill="x", padx=14, pady=(10, 16))
+                      command=save).pack(fill="x", padx=14, pady=(8, 14))
 
     def _ram_model_tip(self, gb):
         if gb >= 64:
@@ -1682,14 +1926,26 @@ class DevsoftIDE(ctk.CTk):
         self.refresh_tasks_panel()
         self._render_files(tab)
         self._restore_editor(tab)
+        self._render_editor_tabs(tab)
         self._render_transcript(tab)
         self._render_terminal(tab)
+        self._update_shell_cwd()
         self.refresh_changes_panel(silent=True)
         self.refresh_git_panel(silent=True)
         self._sync_send_button()
         self._sync_attachment_ui()
         self._update_mode_ui()
         self._update_active_file_ui()
+        v = getattr(tab, "sidebar_view", "files")
+        if v == "sessions":
+            self.sidebar_view_bar.set("💬 Chats")
+            self._show_sidebar_sessions()
+        elif v == "tasks":
+            self.sidebar_view_bar.set("✓ Tasks")
+            self._show_sidebar_tasks()
+        else:
+            self.sidebar_view_bar.set("📁 Files")
+            self._show_sidebar_files()
         # keep the live work card in sync with this tab's run state
         if tab.is_generating:
             self._work_card_render(tab)
@@ -1701,43 +1957,47 @@ class DevsoftIDE(ctk.CTk):
         tb = self.chat_display._textbox
         tb.tag_configure("goal", foreground="#F0F6FC", background="#162032",
                          font=ctk.CTkFont(size=13),
-                         lmargin1=16, lmargin2=16, rmargin=16, spacing3=8, spacing1=4)
-        tb.tag_configure("user_hdr", foreground="#58A6FF",
+                         lmargin1=18, lmargin2=18, rmargin=24, spacing3=8, spacing1=4)
+        tb.tag_configure("user_hdr", foreground="#79C0FF",
                          font=ctk.CTkFont(size=11, weight="bold"),
-                         lmargin1=16, spacing1=8, spacing3=2)
-        tb.tag_configure("assistant", foreground=TEXT, font=ctk.CTkFont(size=13),
-                         lmargin1=16, lmargin2=16, rmargin=24, spacing3=8)
-        tb.tag_configure("asst_hdr", foreground="#3FB950",
+                         lmargin1=18, spacing1=10, spacing3=3)
+        tb.tag_configure("assistant", foreground="#E6EDF3", font=ctk.CTkFont(size=13),
+                         lmargin1=18, lmargin2=18, rmargin=24, spacing3=8, spacing1=2)
+        tb.tag_configure("asst_hdr", foreground=GOLD,
                          font=ctk.CTkFont(size=11, weight="bold"),
-                         lmargin1=16, spacing1=8, spacing3=2)
+                         lmargin1=18, spacing1=12, spacing3=3)
         tb.tag_configure("system", foreground=MUTED, font=ctk.CTkFont(size=11),
-                         justify="center", spacing3=6)
+                         lmargin1=18, spacing3=4)
         tb.tag_configure("activity", foreground=GREEN, font=ctk.CTkFont(size=12, weight="bold"),
-                         lmargin1=16, spacing3=2)
-        tb.tag_configure("tool_start", foreground="#E6EDF3", background="#161B22",
+                         lmargin1=18, spacing3=2)
+        tb.tag_configure("tool_start", foreground="#79C0FF", background="#161B22",
                          font=ctk.CTkFont(family="Menlo", size=11, weight="bold"),
-                         lmargin1=20, lmargin2=20, rmargin=20, spacing1=6, spacing3=2)
-        tb.tag_configure("tool_success", foreground="#3FB950", background="#161B22",
+                         lmargin1=24, lmargin2=24, rmargin=24, spacing1=4, spacing3=2)
+        tb.tag_configure("tool_success", foreground="#7EE787", background="#122619",
                          font=ctk.CTkFont(family="Menlo", size=11),
-                         lmargin1=20, lmargin2=20, rmargin=20, spacing3=6)
-        tb.tag_configure("tool_fail", foreground="#F85149", background="#161B22",
+                         lmargin1=24, lmargin2=24, rmargin=24, spacing3=4)
+        tb.tag_configure("tool_fail", foreground="#FF7B72", background="#2B1416",
                          font=ctk.CTkFont(family="Menlo", size=11),
-                         lmargin1=20, lmargin2=20, rmargin=20, spacing3=6)
+                         lmargin1=24, lmargin2=24, rmargin=24, spacing3=4)
         tb.tag_configure("thinking", foreground="#8B949E", background="#161B22",
                          font=ctk.CTkFont(size=11, slant="italic"),
-                         lmargin1=20, lmargin2=20, rmargin=20, spacing1=4, spacing3=6)
+                         lmargin1=24, lmargin2=24, rmargin=24, spacing1=3, spacing3=4)
         tb.tag_configure("code_hdr", foreground="#8B949E", background="#0D1117",
                          font=ctk.CTkFont(family="Menlo", size=10),
-                         lmargin1=16, lmargin2=16, spacing1=4)
-        tb.tag_configure("copy_btn", foreground="#58A6FF", underline=1,
+                         lmargin1=18, lmargin2=18, spacing1=4)
+        tb.tag_configure("copy_btn", foreground="#79C0FF", underline=1,
                          font=ctk.CTkFont(family="Menlo", size=10, weight="bold"))
-        tb.tag_configure("observation", foreground="#9A9A9A",
+        tb.tag_configure("observation", foreground="#9A9A9A", background="#11161D",
                          font=ctk.CTkFont(family="Menlo", size=11),
-                         lmargin1=16, lmargin2=16, rmargin=16, spacing3=4)
-        tb.tag_configure("error", foreground=RED, font=ctk.CTkFont(family="Menlo", size=11),
-                         lmargin1=16, lmargin2=16, rmargin=16, spacing3=4)
-        tb.tag_configure("success", foreground=GREEN, font=ctk.CTkFont(size=13, weight="bold"),
-                         lmargin1=16, spacing3=8)
+                         lmargin1=24, lmargin2=24, rmargin=24, spacing3=4)
+        tb.tag_configure("error", foreground="#FF7B72", background="#2B1416",
+                         font=ctk.CTkFont(family="Menlo", size=11),
+                         lmargin1=18, lmargin2=18, rmargin=18, spacing3=4)
+        tb.tag_configure("success", foreground="#7EE787", font=ctk.CTkFont(size=13, weight="bold"),
+                         lmargin1=18, spacing3=6)
+        tb.tag_configure("summary", foreground="#7EE787", background="#0B1320",
+                         font=ctk.CTkFont(family="Menlo", size=11),
+                         lmargin1=18, lmargin2=18, rmargin=24, spacing1=6, spacing3=8)
         tb.tag_configure("h1", foreground=TEXT, font=ctk.CTkFont(size=17, weight="bold"),
                          lmargin1=16, spacing1=8, spacing3=4)
         tb.tag_configure("h2", foreground=TEXT, font=ctk.CTkFont(size=15, weight="bold"),
@@ -1919,30 +2179,34 @@ class DevsoftIDE(ctk.CTk):
         try:
             if tag == "goal":
                 if show_header:
-                    tb.insert("end", "👤 You\n", "user_hdr")
+                    tb.insert("end", "\n👤 You\n", "user_hdr")
                 self._insert_markdown(text, "goal")
                 tb.insert("end", "\n")
             elif tag in ("assistant", None):
-                if show_header and not (tb.get("end-2c linestart", "end-1c").startswith("🤖")):
-                    tb.insert("end", "🤖 Devsoft Agent\n", "asst_hdr")
+                if show_header and not (tb.get("end-2c linestart", "end-1c").startswith("◈")):
+                    tb.insert("end", "\n◈ Devsoft Agent\n", "asst_hdr")
                 self._insert_markdown(text, "assistant")
                 tb.insert("end", "\n")
             elif tag == "tool_start":
-                tb.insert("end", text + "\n", "tool_start")
-            elif tag in ("tool_success", "tool_fail"):
-                tb.insert("end", text + "\n", tag)
+                tb.insert("end", f"  ⚙ {text.strip()}\n", "tool_start")
+            elif tag == "tool_success":
+                tb.insert("end", f"  ✓ {text.strip()}\n", "tool_success")
+            elif tag == "tool_fail":
+                tb.insert("end", f"  ✗ {text.strip()}\n", "tool_fail")
             elif tag == "thinking":
-                tb.insert("end", text + "\n", "thinking")
+                tb.insert("end", f"  💭 {text.strip()}\n", "thinking")
             elif tag == "system":
-                tb.insert("end", text + "\n", "system")
+                tb.insert("end", f"  • {text.strip()}\n", "system")
             elif tag == "activity":
-                tb.insert("end", text + "\n", "activity")
+                tb.insert("end", f"  ⚡ {text.strip()}\n", "activity")
             elif tag == "observation":
-                tb.insert("end", text + "\n", "observation")
+                tb.insert("end", f"{text.strip()}\n", "observation")
             elif tag == "error":
-                tb.insert("end", "❌ " + text + "\n", "error")
+                tb.insert("end", f"  ❌ {text.strip()}\n", "error")
             elif tag == "success":
-                tb.insert("end", "✓ " + text + "\n", "success")
+                tb.insert("end", f"  ✓ {text.strip()}\n", "success")
+            elif tag == "summary":
+                tb.insert("end", text + "\n", "summary")
             else:
                 tb.insert("end", text + "\n", tag)
         finally:
@@ -2011,7 +2275,11 @@ class DevsoftIDE(ctk.CTk):
                 installed = {m["name"].split(":")[0] for m in models}
                 self.models_meta = {m["name"]: m for m in models}
                 keep = {k: v for k, v in self.models_inventory.items()
-                        if k.split(":")[0] in installed}
+                        if k.startswith(("groq:", "openrouter:", "gemini:", "cerebras:", "cloud:"))
+                        or k.split(":")[0] in installed}
+                for k, v in FREE_CLOUD_MODELS.items():
+                    if k not in keep:
+                        keep[k] = v
                 for m in models:
                     if m["name"] not in keep:
                         keep[m["name"]] = m["name"]
@@ -2045,8 +2313,9 @@ class DevsoftIDE(ctk.CTk):
                 self.append_chat(f"🧠 Brain for {tab.name}: {display}", tag="system")
                 return
 
-    _TOOL_CAPABLE = ("qwen", "llama3.1", "llama3.2", "mistral", "gemma2", "command-r",
-                     "firefunction", "nexusrouter", "glm", "kimi", "minicpm", "phi3", "phi4")
+    _TOOL_CAPABLE = ("qwen", "llama3.1", "llama3.2", "llama-3.3", "llama3.3", "mistral", "gemma2", "command-r",
+                     "firefunction", "nexusrouter", "glm", "kimi", "minicpm", "phi3", "phi4",
+                     "groq", "gemini", "openrouter", "cerebras")
 
     def _update_tools_badge(self):
         tab = self.active_tab()
@@ -2058,6 +2327,233 @@ class DevsoftIDE(ctk.CTk):
             self.tools_badge.configure(text="⚙ tools", fg_color="#1B3A1B", text_color=GREEN)
         else:
             self.tools_badge.configure(text="⚠ no tools", fg_color="#3A1B1B", text_color=RED)
+
+    def _on_sidebar_view_change(self, value):
+        tab = self.active_tab()
+        if value == "📁 Files":
+            if tab:
+                tab.sidebar_view = "files"
+            self._show_sidebar_files()
+        elif value == "💬 Chats":
+            if tab:
+                tab.sidebar_view = "sessions"
+            self._show_sidebar_sessions()
+        elif value == "✓ Tasks":
+            if tab:
+                tab.sidebar_view = "tasks"
+            self._show_sidebar_tasks()
+
+    def _show_sidebar_files(self):
+        if hasattr(self, "sidebar_sessions_frame"):
+            self.sidebar_sessions_frame.grid_remove()
+        if hasattr(self, "sidebar_tasks_frame"):
+            self.sidebar_tasks_frame.grid_remove()
+        if hasattr(self, "sidebar_files_frame"):
+            self.sidebar_files_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
+        tab = self.active_tab()
+        if tab:
+            self._render_files(tab)
+
+    def _show_sidebar_sessions(self):
+        if hasattr(self, "sidebar_files_frame"):
+            self.sidebar_files_frame.grid_remove()
+        if hasattr(self, "sidebar_tasks_frame"):
+            self.sidebar_tasks_frame.grid_remove()
+        if hasattr(self, "sidebar_sessions_frame"):
+            self.sidebar_sessions_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
+        tab = self.active_tab()
+        if tab:
+            self._render_sessions_list(tab)
+
+    def _show_sidebar_tasks(self):
+        if hasattr(self, "sidebar_files_frame"):
+            self.sidebar_files_frame.grid_remove()
+        if hasattr(self, "sidebar_sessions_frame"):
+            self.sidebar_sessions_frame.grid_remove()
+        if hasattr(self, "sidebar_tasks_frame"):
+            self.sidebar_tasks_frame.grid(row=3, column=0, sticky="nsew", padx=10, pady=(2, 6))
+        self.refresh_tasks_panel()
+
+    @staticmethod
+    def _format_relative_time(ts):
+        if not ts:
+            return "recently"
+        diff = time.time() - ts
+        if diff < 60:
+            return "just now"
+        if diff < 3600:
+            return f"{int(diff // 60)}m ago"
+        if diff < 86400:
+            return f"{int(diff // 3600)}h ago"
+        return f"{int(diff // 86400)}d ago"
+
+    def _render_sessions_list(self, tab):
+        if not hasattr(self, "sessions_container"):
+            return
+        for w in self.sessions_container.winfo_children():
+            w.destroy()
+        if not tab:
+            return
+        root = os.path.join(tab.root, ".agent_sessions")
+        entries = []
+        if os.path.isdir(root):
+            for fn in os.listdir(root):
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(root, fn), encoding="utf-8") as f:
+                        data = json.load(f)
+                    sid = data.get("id") or fn[:-5]
+                    entries.append((
+                        data.get("updated") or 0,
+                        sid,
+                        data.get("name") or "New conversation",
+                        len(data.get("messages") or []),
+                        data.get("model") or tab.model
+                    ))
+                except (OSError, json.JSONDecodeError):
+                    continue
+
+        if not entries:
+            ctk.CTkLabel(self.sessions_container, text="No previous chats yet.\nClick '＋ New' to start one.",
+                         text_color="#666", font=ctk.CTkFont(size=12), justify="center").pack(padx=16, pady=24)
+            return
+
+        q = self.sessions_filter.get().strip().lower() if hasattr(self, "sessions_filter") else ""
+        sorted_entries = sorted(entries, reverse=True)
+        if q:
+            sorted_entries = [e for e in sorted_entries if q in e[2].lower() or q in e[1].lower()]
+
+        for updated, sid, name, nmsg, mod in sorted_entries:
+            is_active = (sid == tab.session_id)
+            card = ctk.CTkFrame(
+                self.sessions_container,
+                fg_color="#141D2B" if is_active else CARD,
+                corner_radius=8,
+                border_width=1 if is_active else 0,
+                border_color=GOLD if is_active else ACTIVE
+            )
+            card.pack(fill="x", padx=4, pady=3)
+
+            top_row = ctk.CTkFrame(card, fg_color="transparent")
+            top_row.pack(fill="x", padx=10, pady=(6, 2))
+            top_row.grid_columnconfigure(0, weight=1)
+
+            disp_name = name[:22] + ("…" if len(name) > 22 else "")
+            title_lbl = ctk.CTkLabel(
+                top_row,
+                text=disp_name,
+                anchor="w",
+                text_color=GOLD if is_active else TEXT,
+                font=ctk.CTkFont(size=11, weight="bold")
+            )
+            title_lbl.grid(row=0, column=0, sticky="w")
+            title_lbl.bind("<Button-1>", lambda _e, s=sid: self._switch_to_session(tab, s))
+
+            ren_btn = ctk.CTkButton(
+                top_row, text="✏️", width=20, height=20,
+                fg_color="transparent", hover_color=ACTIVE, text_color=MUTED,
+                font=ctk.CTkFont(size=10),
+                command=lambda s=sid: self._rename_session_dialog(tab, s)
+            )
+            ren_btn.grid(row=0, column=1, padx=(2, 0))
+            Tooltip(ren_btn, "Rename chat")
+
+            del_btn = ctk.CTkButton(
+                top_row, text="🗑️", width=20, height=20,
+                fg_color="transparent", hover_color="#4A1A1A", text_color=MUTED,
+                font=ctk.CTkFont(size=10),
+                command=lambda s=sid: self._delete_session_dialog(tab, s)
+            )
+            del_btn.grid(row=0, column=2, padx=(2, 0))
+            Tooltip(del_btn, "Delete chat")
+
+            meta_row = ctk.CTkFrame(card, fg_color="transparent")
+            meta_row.pack(fill="x", padx=10, pady=(0, 6))
+            rel_time = self._format_relative_time(updated)
+            m_short = mod.split(":")[0]
+            meta_lbl = ctk.CTkLabel(
+                meta_row,
+                text=f"{rel_time} · {nmsg} msgs · {m_short}",
+                text_color=MUTED,
+                font=ctk.CTkFont(size=10)
+            )
+            meta_lbl.pack(side="left")
+            meta_lbl.bind("<Button-1>", lambda _e, s=sid: self._switch_to_session(tab, s))
+            card.bind("<Button-1>", lambda _e, s=sid: self._switch_to_session(tab, s))
+
+    def _switch_to_session(self, tab, sid):
+        if not tab:
+            return
+        tab.session_id = sid
+        _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
+        self._load_session_tasks(tab, sid)
+        self._load_session_transcript(tab, sid)
+        self.refresh_sessions(tab, keep_selection=True)
+        self.main_tabs.set("Chat")
+
+    def _rename_session_dialog(self, tab, sid):
+        path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+        cur_name = sid
+        try:
+            with open(path, encoding="utf-8") as f:
+                cur_name = json.load(f).get("name") or sid
+        except Exception:
+            pass
+
+        win = ctk.CTkToplevel(self)
+        win.title("Rename Chat")
+        win.geometry("380x170")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+
+        ctk.CTkLabel(win, text="Chat Title:", text_color=TEXT,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 6))
+        entry = ctk.CTkEntry(win, height=32, fg_color=CARD, border_color=ACTIVE, text_color=TEXT)
+        entry.pack(fill="x", padx=20, pady=(0, 14))
+        entry.insert(0, cur_name)
+        entry.focus()
+
+        def do_rename():
+            new_name = entry.get().strip()
+            if new_name and os.path.exists(path):
+                try:
+                    with open(path, encoding="utf-8") as f:
+                        data = json.load(f)
+                    data["name"] = new_name
+                    with open(path, "w", encoding="utf-8") as f:
+                        json.dump(data, f, indent=2)
+                    self.refresh_sessions(tab)
+                except Exception as e:
+                    self.append_chat(f"❌ Rename failed: {e}", tag="error")
+            win.destroy()
+
+        entry.bind("<Return>", lambda _e: do_rename())
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=4)
+        ctk.CTkButton(btns, text="Cancel", width=80, height=28, fg_color=CARD,
+                      hover_color=ACTIVE, text_color=TEXT, command=win.destroy).pack(side="left")
+        ctk.CTkButton(btns, text="Save", width=80, height=28, fg_color=GOLD,
+                      text_color="#000", hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
+                      command=do_rename).pack(side="right")
+
+    def _delete_session_dialog(self, tab, sid):
+        path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
+        if os.path.exists(path):
+            try:
+                os.remove(path)
+                if tab.session_id == sid:
+                    tab.session_id = None
+                    tab.transcript.clear()
+                    tab.tasks_data = []
+                    self._render_transcript(tab)
+                    self.refresh_tasks_panel()
+                self.refresh_sessions(tab)
+                self.append_chat(f"🗑 Deleted chat {sid[-6:]}", tag="system")
+            except Exception as e:
+                self.append_chat(f"❌ Delete failed: {e}", tag="error")
 
     def refresh_sessions(self, tab, keep_selection=False):
         labels = ["(new chat)"]
@@ -2087,6 +2583,7 @@ class DevsoftIDE(ctk.CTk):
             if sid == tab.session_id:
                 current = label
         self.sessions_dropdown.set(current or "(new chat)")
+        self._render_sessions_list(tab)
 
     def on_session_selected(self, label):
         tab = self.active_tab()
@@ -2387,22 +2884,159 @@ class DevsoftIDE(ctk.CTk):
         if tab:
             self._render_files(tab)
 
+    def _toggle_dir_expansion(self, tab, rel_dir):
+        if not tab:
+            return
+        if not hasattr(tab, "expanded_dirs"):
+            tab.expanded_dirs = set()
+        if rel_dir in tab.expanded_dirs:
+            tab.expanded_dirs.remove(rel_dir)
+        else:
+            tab.expanded_dirs.add(rel_dir)
+        self._render_files(tab)
+
+    def _expand_all_dirs(self, tab):
+        if not tab:
+            return
+        if not hasattr(tab, "expanded_dirs"):
+            tab.expanded_dirs = set()
+        for rel in tab.files:
+            parts = rel.split(os.sep)
+            for i in range(1, len(parts)):
+                tab.expanded_dirs.add(os.path.join(*parts[:i]))
+        self._render_files(tab)
+
+    def _collapse_all_dirs(self, tab):
+        if not tab:
+            return
+        if not hasattr(tab, "expanded_dirs"):
+            tab.expanded_dirs = set()
+        tab.expanded_dirs.clear()
+        self._render_files(tab)
+
     def _render_files(self, tab):
+        if not hasattr(self, "files_container"):
+            return
         for w in self.files_container.winfo_children():
             w.destroy()
-        self._scan_files(tab)
-        q = self.files_filter.get().strip().lower()
-        shown = [rel for rel in tab.files if q in rel.lower()] if q else tab.files
-        if not shown:
-            ctk.CTkLabel(self.files_container, text="No files match" if q else "No files",
-                         text_color="#555", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=8, pady=8)
+        if not tab:
             return
-        for rel in shown[:400]:
-            btn = ctk.CTkButton(self.files_container, text=rel, anchor="w", height=24,
-                                fg_color="transparent", hover_color=ACTIVE, text_color=TEXT,
-                                font=ctk.CTkFont(family="Menlo", size=11),
-                                command=lambda r=rel: self.open_file(r))
-            btn.pack(fill="x", padx=4, pady=0)
+        self._scan_files(tab)
+        if not tab.files:
+            ctk.CTkLabel(self.files_container, text="No files found",
+                         text_color="#666", font=ctk.CTkFont(size=11)).pack(anchor="w", padx=12, pady=8)
+            return
+
+        if not hasattr(tab, "expanded_dirs"):
+            tab.expanded_dirs = set()
+
+        # On initial project load, auto-expand top-level directories
+        if not getattr(tab, "_initial_dirs_expanded", False):
+            for rel in tab.files:
+                parts = rel.split(os.sep)
+                if len(parts) > 1:
+                    tab.expanded_dirs.add(parts[0])
+            tab._initial_dirs_expanded = True
+
+        q = self.files_filter.get().strip().lower() if hasattr(self, "files_filter") else ""
+
+        # Build directory structure
+        dir_subdirs = collections.defaultdict(set)
+        dir_files = collections.defaultdict(list)
+
+        filtered_files = [f for f in tab.files if q in f.lower()] if q else tab.files
+        if q:
+            # Auto-expand all parent folders of matching files
+            for rel in filtered_files:
+                parts = rel.split(os.sep)
+                for i in range(1, len(parts)):
+                    tab.expanded_dirs.add(os.path.join(*parts[:i]))
+
+        for rel in filtered_files:
+            parts = rel.split(os.sep)
+            if len(parts) == 1:
+                dir_files[""].append(parts[0])
+            else:
+                for i in range(len(parts) - 1):
+                    parent = os.path.join(*parts[:i]) if i > 0 else ""
+                    sub = parts[i]
+                    dir_subdirs[parent].add(sub)
+                parent_dir = os.path.join(*parts[:-1])
+                dir_files[parent_dir].append(parts[-1])
+
+        # Icon mapping
+        ext_icons = {
+            ".py": "🐍", ".pyw": "🐍",
+            ".js": "⚡", ".ts": "⚡", ".jsx": "⚡", ".tsx": "⚡",
+            ".json": "{}", ".jsonc": "{}",
+            ".html": "🌐", ".htm": "🌐", ".css": "🎨", ".scss": "🎨",
+            ".md": "📝", ".txt": "📄", ".rst": "📝",
+            ".sh": "🐚", ".bash": "🐚", ".zsh": "🐚",
+            ".yml": "⚙", ".yaml": "⚙", ".toml": "⚙", ".ini": "⚙",
+            ".png": "🖼", ".jpg": "🖼", ".jpeg": "🖼", ".svg": "🖼",
+            ".lock": "🔒", ".gitignore": "⎇",
+        }
+
+        def render_level(curr_dir, level):
+            # Render immediate subdirectories first
+            for sub in sorted(dir_subdirs.get(curr_dir, [])):
+                rel_dir = os.path.join(curr_dir, sub) if curr_dir else sub
+                is_expanded = (rel_dir in tab.expanded_dirs)
+                arrow = "▾" if is_expanded else "▸"
+                f_icon = "📂" if is_expanded else "📁"
+
+                row = ctk.CTkFrame(self.files_container, fg_color="transparent", height=24)
+                row.pack(fill="x", padx=2, pady=1)
+
+                pad_left = level * 14 + 4
+                btn = ctk.CTkButton(
+                    row,
+                    text=f"{arrow} {f_icon} {sub}",
+                    anchor="w",
+                    height=22,
+                    fg_color="transparent",
+                    hover_color=ACTIVE,
+                    text_color="#D8DEE9",
+                    font=ctk.CTkFont(family="Menlo", size=11, weight="bold"),
+                    command=lambda d=rel_dir: self._toggle_dir_expansion(tab, d)
+                )
+                btn.pack(side="left", fill="x", expand=True, padx=(pad_left, 2))
+
+                if is_expanded:
+                    render_level(rel_dir, level + 1)
+
+            # Render immediate files
+            for fn in sorted(dir_files.get(curr_dir, [])):
+                rel_file = os.path.join(curr_dir, fn) if curr_dir else fn
+                ext = os.path.splitext(fn)[1].lower()
+                icon = ext_icons.get(ext, "📄")
+
+                is_active = (tab.editor_path == rel_file)
+                dirty_mark = ""
+                file_color = TEXT
+                if hasattr(tab, "changed_files") and rel_file in tab.changed_files:
+                    st = tab.changed_files[rel_file]
+                    dirty_mark = " ●"
+                    file_color = GOLD if st == "M" else (GREEN if st == "A" else BLUE)
+
+                row = ctk.CTkFrame(self.files_container, fg_color="#162032" if is_active else "transparent", height=24, corner_radius=4)
+                row.pack(fill="x", padx=2, pady=1)
+
+                pad_left = level * 14 + 18
+                btn = ctk.CTkButton(
+                    row,
+                    text=f"{icon}  {fn}{dirty_mark}",
+                    anchor="w",
+                    height=22,
+                    fg_color="transparent",
+                    hover_color=ACTIVE,
+                    text_color=GOLD if is_active else file_color,
+                    font=ctk.CTkFont(family="Menlo", size=11, weight="bold" if is_active else "normal"),
+                    command=lambda r=rel_file: self.open_file(r)
+                )
+                btn.pack(side="left", fill="x", expand=True, padx=(pad_left, 2))
+
+        render_level("", 0)
 
     def _stash_editor(self):
         tab = self.active_tab()
@@ -2906,17 +3540,96 @@ class DevsoftIDE(ctk.CTk):
         self._update_gutter()
         self._highlight_editor(self._lang_for_path(tab.editor_path))
         self._sync_gutter_scroll()
+        self._render_editor_tabs(tab)
+        self._on_editor_cursor_moved()
 
     def _update_editor_status(self, tab):
         if not tab.editor_path:
             self.editor_path_label.configure(text="No file open", text_color=MUTED)
             self.editor_save_btn.configure(fg_color=CARD, text_color=TEXT)
+            self.editor_lang_label.configure(text="Plain Text")
             return
         mark = "  ● unsaved" if tab.editor_dirty else ""
         self.editor_path_label.configure(text=f"{tab.editor_path}{mark}",
                                          text_color=GOLD if tab.editor_dirty else MUTED)
         self.editor_save_btn.configure(fg_color=GOLD if tab.editor_dirty else CARD,
                                        text_color="#000" if tab.editor_dirty else TEXT)
+        lang = self._lang_for_path(tab.editor_path) or "Plain Text"
+        self.editor_lang_label.configure(text=lang.capitalize())
+
+    def _on_editor_cursor_moved(self, event=None):
+        try:
+            idx = self.editor_box.index("insert")
+            line, col = idx.split(".")
+            self.editor_pos_label.configure(text=f"Ln {line}, Col {int(col)+1}")
+        except Exception:
+            pass
+
+    def _render_editor_tabs(self, tab):
+        if not hasattr(self, "editor_tabs_frame"):
+            return
+        for w in self.editor_tabs_frame.winfo_children():
+            w.destroy()
+        if not getattr(tab, "open_files", None):
+            ctk.CTkLabel(self.editor_tabs_frame, text="No open files", text_color="#555",
+                         font=ctk.CTkFont(size=11)).pack(side="left", padx=10, pady=4)
+            return
+        for rel in tab.open_files:
+            is_active = (rel == tab.editor_path)
+            base = os.path.basename(rel)
+            dirty_mark = " ●" if (is_active and tab.editor_dirty) else ""
+            chip = ctk.CTkFrame(
+                self.editor_tabs_frame,
+                fg_color="#1F242C" if is_active else CARD,
+                corner_radius=6,
+                border_width=1 if is_active else 0,
+                border_color=GOLD if is_active else ACTIVE
+            )
+            chip.pack(side="left", padx=(0, 6), pady=2)
+            lbl = ctk.CTkButton(
+                chip,
+                text=f"{base}{dirty_mark}",
+                width=max(len(base) * 7 + 16, 40),
+                height=24,
+                fg_color="transparent",
+                text_color=GOLD if is_active else TEXT,
+                font=ctk.CTkFont(family="Menlo", size=11, weight="bold" if is_active else "normal"),
+                command=lambda r=rel: self.open_file(r)
+            )
+            lbl.pack(side="left", padx=(4, 0))
+            close_btn = ctk.CTkButton(
+                chip,
+                text="×",
+                width=18,
+                height=20,
+                fg_color="transparent",
+                hover_color="#4A1A1A",
+                text_color=RED if is_active else MUTED,
+                font=ctk.CTkFont(size=12, weight="bold"),
+                command=lambda r=rel: self.close_editor_file(r)
+            )
+            close_btn.pack(side="left", padx=(0, 4))
+
+    def close_editor_file(self, rel):
+        tab = self.active_tab()
+        if not tab:
+            return
+        if hasattr(tab, "open_files") and rel in tab.open_files:
+            tab.open_files.remove(rel)
+        if tab.editor_path == rel:
+            if getattr(tab, "open_files", None):
+                next_file = tab.open_files[-1]
+                self.open_file(next_file)
+            else:
+                tab.editor_path = None
+                tab.editor_text = ""
+                tab.editor_buf = ""
+                tab.editor_dirty = False
+                self.editor_box.delete("1.0", "end")
+                self._update_editor_status(tab)
+                self._render_editor_tabs(tab)
+        else:
+            self._render_editor_tabs(tab)
 
     def _mark_editor_dirty(self, _event=None):
         tab = self.active_tab()
@@ -2928,6 +3641,7 @@ class DevsoftIDE(ctk.CTk):
             return
         tab.editor_dirty = current != tab.editor_text
         self._update_editor_status(tab)
+        self._render_editor_tabs(tab)
 
     def open_file(self, rel, line=None):
         tab = self.active_tab()
@@ -2944,6 +3658,10 @@ class DevsoftIDE(ctk.CTk):
         if b"\0" in content.encode("utf-8", "replace")[:1000]:
             self.append_chat(f"binary file: {rel}", tag="system")
             return
+        if not hasattr(tab, "open_files"):
+            tab.open_files = []
+        if rel not in tab.open_files:
+            tab.open_files.append(rel)
         tab.editor_path = rel
         tab.editor_text = content
         tab.editor_buf = content
@@ -2968,6 +3686,7 @@ class DevsoftIDE(ctk.CTk):
         tab.editor_buf = content
         tab.editor_dirty = False
         self._update_editor_status(tab)
+        self._render_editor_tabs(tab)
         self.append_chat(f"💾 Saved {tab.editor_path}", tag="success")
         self._render_files(tab)
 
@@ -2991,6 +3710,7 @@ class DevsoftIDE(ctk.CTk):
         total = int(self.terminal_box.index("end-1c").split(".")[0])
         if total > 4000:
             self.terminal_box.delete("1.0", f"{total - 3000}.0")
+        self.terminal_lines_lbl.configure(text=f"{total} lines")
         self.terminal_box.configure(state="disabled")
         try:
             self.terminal_box.see("end")
@@ -3004,74 +3724,35 @@ class DevsoftIDE(ctk.CTk):
         self.terminal_box.configure(state="normal")
         self.terminal_box.delete("1.0", "end")
         self.terminal_box.configure(state="disabled")
+        self.terminal_lines_lbl.configure(text="0 lines")
 
-    def _shell_start(self):
-        if self.shell_proc and self.shell_proc.poll() is None:
-            return
-        import pty, select
+    def _copy_terminal_output(self):
         tab = self.active_tab()
-        cwd = tab.root if tab else os.getcwd()
-        self.shell_proc = pty.fork()
-        if self.shell_proc[0] == 0:
-            os.execvp("bash", ["bash", "-i"])
-        pid, fd = self.shell_proc
-        os.set_blocking(fd, False)
-        self.shell_box.configure(state="normal")
-        self.shell_box.delete("1.0", "end")
-        self.shell_box.insert("end", f"$ bash (pid {pid}) — type below, ⏎ to run\n\n")
-        self.shell_box.configure(state="disabled")
-        self._shell_fd = fd
-        self._shell_read_loop(fd)
+        if tab and tab.raw_log:
+            text = "\n".join(tab.raw_log)
+        else:
+            text = self.terminal_box.get("1.0", "end-1c")
+        self._copy_to_clipboard(text)
+        self.append_chat("📋 Copied terminal logs to clipboard.", tag="system")
 
-    def _shell_read_loop(self, fd):
-        import select
+    def _on_terminal_filter(self, event=None):
+        tab = self.active_tab()
+        if not tab:
+            return
+        q = self.terminal_filter.get().strip().lower()
+        self.terminal_box.configure(state="normal")
+        self.terminal_box.delete("1.0", "end")
+        if not q:
+            lines = tab.raw_log[-3000:]
+        else:
+            lines = [l for l in tab.raw_log if q in l.lower()][-3000:]
+        self.terminal_box.insert("1.0", "\n".join(lines) + "\n")
+        self.terminal_lines_lbl.configure(text=f"{len(lines)} lines")
+        self.terminal_box.configure(state="disabled")
         try:
-            r, _, _ = select.select([fd], [], [], 0.05)
-            if r:
-                data = os.read(fd, 4096).decode("utf-8", errors="replace")
-                self.shell_box.configure(state="normal")
-                self.shell_box.insert("end", data)
-                self.shell_box.see("end")
-                self.shell_box.configure(state="disabled")
-        except OSError:
-            self._shell_kill()
-            return
-        if self.shell_proc and self.shell_proc[0] and self.shell_proc[0].poll() is None:
-            self.after(50, lambda: self._shell_read_loop(fd))
-
-    def _on_shell_key(self, event):
-        if not self.shell_proc or self.shell_proc[0] is None:
-            return
-        if event.keysym in ("Shift_L", "Shift_R", "Control_L", "Control_R",
-                            "Alt_L", "Alt_R", "Meta_L", "Meta_R"):
-            return
-        pid, fd = self.shell_proc
-        ch = event.char if event.char else ""
-        if event.keysym == "Return":
-            ch = "\r"
-        elif event.keysym == "BackSpace":
-            ch = "\x7f"
-        elif event.keysym == "Tab":
-            ch = "\t"
-        elif not ch:
-            return
-        try:
-            os.write(fd, ch.encode())
-        except OSError:
+            self.terminal_box.see("end")
+        except Exception:
             pass
-
-    def _shell_kill(self):
-        if self.shell_proc and self.shell_proc[0]:
-            try:
-                os.kill(self.shell_proc[0], 9)
-            except OSError:
-                pass
-        self.shell_proc = None
-
-    def _shell_clear(self):
-        self.shell_box.configure(state="normal")
-        self.shell_box.delete("1.0", "end")
-        self.shell_box.configure(state="disabled")
 
     def run_tests(self):
         tab = self.active_tab()
@@ -3121,15 +3802,147 @@ class DevsoftIDE(ctk.CTk):
         self.terminal_box.delete("1.0", "end")
         if tab.raw_log:
             self.terminal_box.insert("1.0", "\n".join(tab.raw_log[-3000:]) + "\n")
+            self.terminal_lines_lbl.configure(text=f"{len(tab.raw_log)} lines")
         else:
             self.terminal_box.insert(
                 "1.0", "— terminal idle —\nraw agent output (plans, tool calls, command results)\n"
                        "streams here while a run is active.\n")
+            self.terminal_lines_lbl.configure(text="0 lines")
         self.terminal_box.configure(state="disabled")
         try:
             self.terminal_box.see("end")
         except Exception:
             pass
+
+    # -------------------------------------------------------- shell console --
+    def _setup_shell_tags(self):
+        tb = self.shell_box._textbox
+        tb.tag_configure("prompt", foreground=GOLD, font=ctk.CTkFont(family="Menlo", size=12, weight="bold"))
+        tb.tag_configure("normal", foreground="#D4D4D4", font=ctk.CTkFont(family="Menlo", size=12))
+        tb.tag_configure("error", foreground="#FF7B72", font=ctk.CTkFont(family="Menlo", size=12))
+        tb.tag_configure("info", foreground="#79C0FF", font=ctk.CTkFont(family="Menlo", size=12))
+
+    def _update_shell_cwd(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        rel = os.path.basename(tab.root) or tab.root
+        self.shell_cwd_label.configure(text=f"📁 {rel}")
+
+    def run_shell_command(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        cmd = self.shell_entry.get().strip()
+        if not cmd:
+            return
+        self.shell_entry.delete(0, "end")
+        if not getattr(tab, "shell_history", None):
+            tab.shell_history = []
+        if not tab.shell_history or tab.shell_history[-1] != cmd:
+            tab.shell_history.append(cmd)
+        tab.shell_history_idx = len(tab.shell_history)
+
+        self._append_shell_output(f"\n➜ [{tab.name}]$ {cmd}\n", "prompt")
+
+        if cmd.startswith("cd "):
+            target = cmd[3:].strip()
+            new_cwd = os.path.abspath(os.path.join(tab.root, target))
+            if os.path.isdir(new_cwd):
+                tab.root = new_cwd
+                self._update_shell_cwd()
+                self._render_files(tab)
+                self._append_shell_output(f"Changed working directory to {new_cwd}\n", "info")
+                return
+            else:
+                self._append_shell_output(f"cd: no such directory: {target}\n", "error")
+                return
+
+        self.shell_status_badge.configure(text="● RUNNING", text_color=GOLD, fg_color="#2E2412")
+
+        def worker():
+            try:
+                proc = subprocess.Popen(
+                    cmd,
+                    shell=True,
+                    cwd=tab.root,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.STDOUT,
+                    text=True,
+                    bufsize=1,
+                    universal_newlines=True
+                )
+                tab.shell_running_proc = proc
+                for line in iter(proc.stdout.readline, ''):
+                    if not line:
+                        break
+                    self.after(0, self._append_shell_output, line, "normal")
+                proc.stdout.close()
+                ret = proc.wait()
+                tab.shell_running_proc = None
+                code_msg = f"[Process completed with exit code {ret}]\n"
+                tag = "info" if ret == 0 else "error"
+                self.after(0, self._append_shell_output, code_msg, tag)
+                self.after(0, lambda: self.shell_status_badge.configure(text="● IDLE", text_color=GREEN, fg_color="#122619"))
+            except Exception as e:
+                tab.shell_running_proc = None
+                self.after(0, self._append_shell_output, f"[Error: {e}]\n", "error")
+                self.after(0, lambda: self.shell_status_badge.configure(text="● ERROR", text_color=RED, fg_color="#2F1517"))
+
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _append_shell_output(self, text, tag="normal"):
+        self.shell_box.configure(state="normal")
+        self.shell_box.insert("end", text, tag)
+        total = int(self.shell_box.index("end-1c").split(".")[0])
+        if total > 4000:
+            self.shell_box.delete("1.0", f"{total - 3000}.0")
+        self.shell_box.configure(state="disabled")
+        try:
+            self.shell_box.see("end")
+        except Exception:
+            pass
+
+    def shell_kill_running(self):
+        tab = self.active_tab()
+        if tab and getattr(tab, "shell_running_proc", None):
+            try:
+                tab.shell_running_proc.terminate()
+                self._append_shell_output("\n[Process terminated by user]\n", "error")
+            except Exception:
+                pass
+            tab.shell_running_proc = None
+            self.shell_status_badge.configure(text="● IDLE", text_color=GREEN, fg_color="#122619")
+
+    def _shell_clear(self):
+        self.shell_box.configure(state="normal")
+        self.shell_box.delete("1.0", "end")
+        self.shell_box.configure(state="disabled")
+
+    def on_shell_history_up(self, event=None):
+        tab = self.active_tab()
+        if not tab or not getattr(tab, "shell_history", None):
+            return "break"
+        if tab.shell_history_idx > 0:
+            tab.shell_history_idx -= 1
+            cmd = tab.shell_history[tab.shell_history_idx]
+            self.shell_entry.delete(0, "end")
+            self.shell_entry.insert(0, cmd)
+        return "break"
+
+    def on_shell_history_down(self, event=None):
+        tab = self.active_tab()
+        if not tab or not getattr(tab, "shell_history", None):
+            return "break"
+        if tab.shell_history_idx < len(tab.shell_history) - 1:
+            tab.shell_history_idx += 1
+            cmd = tab.shell_history[tab.shell_history_idx]
+            self.shell_entry.delete(0, "end")
+            self.shell_entry.insert(0, cmd)
+        else:
+            tab.shell_history_idx = len(tab.shell_history)
+            self.shell_entry.delete(0, "end")
+        return "break"
 
     # -------------------------------------------------------- changes --
     def _git(self, tab, *args):
@@ -3167,7 +3980,7 @@ class DevsoftIDE(ctk.CTk):
             lbl.pack(anchor="w", padx=8, pady=8)
             self._show_diff(None, "")
             return
-        status_colors = {"M": GOLD, "A": GREEN, "D": RED, "??": BLUE, "R": GREEN}
+        status_colors = {"M": GOLD, "A": GREEN, "D": RED, "?": BLUE, "R": GREEN}
         for e in entries:
             st, path = e[:2], e[3:].strip()
             if " -> " in path:
@@ -3176,24 +3989,33 @@ class DevsoftIDE(ctk.CTk):
             key = st.strip()[0] if st.strip() else "?"
             color = status_colors.get(key, MUTED)
             row = ctk.CTkFrame(self.changes_list, fg_color="transparent")
-            row.pack(fill="x", padx=4, pady=0)
-            btn = ctk.CTkButton(row, text=f"{st.strip():2} {path}", anchor="w",
+            row.pack(fill="x", padx=4, pady=1)
+            
+            # Status pill
+            pill = ctk.CTkLabel(row, text=key, width=20, height=20, fg_color=CARD,
+                                text_color=color, corner_radius=4,
+                                font=ctk.CTkFont(family="Menlo", size=10, weight="bold"))
+            pill.pack(side="left", padx=(0, 4))
+            
+            btn = ctk.CTkButton(row, text=path, anchor="w",
                                 height=24, fg_color="transparent", hover_color=ACTIVE,
-                                text_color=color, font=ctk.CTkFont(family="Menlo", size=11),
+                                text_color=TEXT, font=ctk.CTkFont(family="Menlo", size=11),
                                 command=lambda p=path, s=key: self._select_change(p, s))
             btn.pack(side="left", fill="x", expand=True)
             rev = ctk.CTkButton(row, text="↩", width=24, height=22,
                                 fg_color="transparent", hover_color="#4A1A1A",
-                                text_color="#666", font=ctk.CTkFont(size=11),
+                                text_color="#888", font=ctk.CTkFont(size=11),
                                 command=lambda p=path: self._revert_file(p))
             rev.pack(side="right", padx=(2, 0))
+            Tooltip(rev, f"Revert changes in {path}")
             openb = ctk.CTkButton(row, text="↗", width=24, height=22,
                                   fg_color="transparent", hover_color=ACTIVE,
-                                  text_color="#666", font=ctk.CTkFont(size=11),
+                                  text_color="#888", font=ctk.CTkFont(size=11),
                                   command=lambda p=path: self.open_file(p))
             openb.pack(side="right", padx=(2, 0))
+            Tooltip(openb, f"Open {path} in Editor")
             tab.changed_files[path] = key
-        if not silent:
+        if not silent and tab.changed_files:
             first = next(iter(tab.changed_files))
             self._select_change(first, tab.changed_files[first])
 
@@ -3207,6 +4029,18 @@ class DevsoftIDE(ctk.CTk):
         else:
             self.append_chat(f"❌ Revert failed: {out.strip()[:200]}", tag="error")
         self.refresh_changes_panel(silent=True)
+        self._render_files(tab)
+
+    def _revert_all_changes(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        code, out = self._git(tab, "checkout", "--", ".")
+        self._git(tab, "clean", "-fd")
+        self.refresh_changes_panel()
+        self.refresh_git_panel()
+        self._render_files(tab)
+        self.append_chat("↩ Reverted all working tree changes.", tag="system")
 
     def _select_change(self, path, status):
         tab = self.active_tab()
@@ -3229,20 +4063,27 @@ class DevsoftIDE(ctk.CTk):
         self.diff_box.configure(state="normal")
         self.diff_box.delete("1.0", "end")
         tb = self.diff_box._textbox
-        for tag, color in (("add", "#81C784"), ("del", "#EF9A9A"), ("meta", GOLD),
-                           ("hunk", "#90CAF9")):
-            tb.tag_configure(tag, foreground=color)
+        for tag, color, bg in (
+            ("add", "#7EE787", "#122619"),
+            ("del", "#FF7B72", "#2B1416"),
+            ("meta", "#D29922", "#161B22"),
+            ("hunk", "#79C0FF", "#162032"),
+            ("hdr", "#8B949E", "#0D1117")
+        ):
+            tb.tag_configure(tag, foreground=color, background=bg)
         if path is None:
-            tb.insert("end", "Select a changed file to view its diff.\n")
+            tb.insert("end", "Select a changed file from the left to view its diff.\n")
         else:
-            tb.insert("end", f"── {path} ──\n", "meta")
+            tb.insert("end", f"── Diff: {path} ──────────────────────────────────────\n", "hdr")
             for line in diff.splitlines():
-                if line.startswith("+"):
+                if line.startswith("+") and not line.startswith("+++"):
                     tb.insert("end", line + "\n", "add")
-                elif line.startswith("-"):
+                elif line.startswith("-") and not line.startswith("---"):
                     tb.insert("end", line + "\n", "del")
                 elif line.startswith("@@"):
                     tb.insert("end", line + "\n", "hunk")
+                elif line.startswith("diff ") or line.startswith("index ") or line.startswith("---") or line.startswith("+++"):
+                    tb.insert("end", line + "\n", "meta")
                 else:
                     tb.insert("end", line + "\n")
         self.diff_box.configure(state="disabled")
@@ -3281,7 +4122,20 @@ class DevsoftIDE(ctk.CTk):
     def _render_git_log(self, log):
         self.git_log_box.configure(state="normal")
         self.git_log_box.delete("1.0", "end")
-        self.git_log_box.insert("1.0", log if log else "— no commits yet —")
+        tb = self.git_log_box._textbox
+        tb.tag_configure("hash", foreground=GOLD, font=ctk.CTkFont(family="Menlo", size=11, weight="bold"))
+        tb.tag_configure("msg", foreground=TEXT, font=ctk.CTkFont(family="Menlo", size=11))
+        if not log:
+            tb.insert("1.0", "— no commits yet —\n")
+        else:
+            for line in log.splitlines():
+                parts = line.split(" ", 1)
+                if len(parts) == 2:
+                    sha, msg = parts
+                    tb.insert("end", f" {sha} ", "hash")
+                    tb.insert("end", f" {msg}\n", "msg")
+                else:
+                    tb.insert("end", line + "\n")
         self.git_log_box.configure(state="disabled")
 
     def git_init_repo(self):
@@ -3333,6 +4187,148 @@ class DevsoftIDE(ctk.CTk):
 
     def git_push(self):
         self._git_action("push", ["push"])
+
+    def _apply_git_prefix(self, prefix):
+        current = self.git_commit_msg.get().strip()
+        match = re.match(r"^(feat|fix|docs|style|refactor|test|chore):\s*(.*)", current)
+        if match:
+            rest = match.group(2)
+            new_text = f"{prefix} {rest}"
+        elif current:
+            new_text = f"{prefix} {current}"
+        else:
+            new_text = f"{prefix} "
+        self.git_commit_msg.delete(0, "end")
+        self.git_commit_msg.insert(0, new_text)
+        self.git_commit_msg.focus()
+        self.git_commit_msg.icursor(len(new_text))
+
+    def _new_branch_dialog(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Create New Branch")
+        win.geometry("380x180")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+
+        ctk.CTkLabel(win, text="Branch Name:", text_color=TEXT,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 6))
+        entry = ctk.CTkEntry(win, height=32, placeholder_text="e.g. feature/fast-response",
+                             fg_color=CARD, border_color=ACTIVE, text_color=TEXT)
+        entry.pack(fill="x", padx=20, pady=(0, 14))
+        entry.focus()
+
+        def create():
+            name = entry.get().strip()
+            if not name:
+                return
+            code, out = self._git(tab, "checkout", "-b", name)
+            win.destroy()
+            if code == 0:
+                self.append_chat(f"🌿 Created and switched to branch '{name}'", tag="success")
+            else:
+                self.append_chat(f"❌ Failed to create branch: {out.strip()}", tag="error")
+            self.refresh_git_panel()
+
+        entry.bind("<Return>", lambda _e: create())
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=4)
+        ctk.CTkButton(btns, text="Cancel", width=80, height=28, fg_color=CARD,
+                      hover_color=ACTIVE, text_color=TEXT, command=win.destroy).pack(side="left")
+        ctk.CTkButton(btns, text="Create", width=90, height=28, fg_color=GOLD,
+                      text_color="#000", hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
+                      command=create).pack(side="right")
+
+    # -------------------------------------------------------- file operations --
+    def _new_file_dialog(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Create New File")
+        win.geometry("380x180")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+
+        ctk.CTkLabel(win, text="File Path (relative to project root):", text_color=TEXT,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 6))
+        entry = ctk.CTkEntry(win, height=32, placeholder_text="e.g. src/index.py",
+                             fg_color=CARD, border_color=ACTIVE, text_color=TEXT)
+        entry.pack(fill="x", padx=20, pady=(0, 14))
+        entry.focus()
+
+        def create():
+            rel = entry.get().strip().lstrip("/")
+            if not rel:
+                return
+            path = os.path.join(tab.root, rel)
+            try:
+                os.makedirs(os.path.dirname(path), exist_ok=True)
+                if not os.path.exists(path):
+                    with open(path, "w", encoding="utf-8") as f:
+                        f.write("")
+                win.destroy()
+                self._scan_files(tab)
+                self._render_files(tab)
+                self.open_file(rel)
+            except OSError as e:
+                self.append_chat(f"❌ Failed to create file: {e}", tag="error")
+
+        entry.bind("<Return>", lambda _e: create())
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=4)
+        ctk.CTkButton(btns, text="Cancel", width=80, height=28, fg_color=CARD,
+                      hover_color=ACTIVE, text_color=TEXT, command=win.destroy).pack(side="left")
+        ctk.CTkButton(btns, text="Create File", width=100, height=28, fg_color=GOLD,
+                      text_color="#000", hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
+                      command=create).pack(side="right")
+
+    def _new_folder_dialog(self):
+        tab = self.active_tab()
+        if not tab:
+            return
+        win = ctk.CTkToplevel(self)
+        win.title("Create New Folder")
+        win.geometry("380x180")
+        win.configure(fg_color=BG)
+        win.transient(self)
+        win.lift()
+        win.focus_force()
+
+        ctk.CTkLabel(win, text="Folder Path (relative to project root):", text_color=TEXT,
+                     font=ctk.CTkFont(size=12, weight="bold")).pack(anchor="w", padx=20, pady=(16, 6))
+        entry = ctk.CTkEntry(win, height=32, placeholder_text="e.g. src/components",
+                             fg_color=CARD, border_color=ACTIVE, text_color=TEXT)
+        entry.pack(fill="x", padx=20, pady=(0, 14))
+        entry.focus()
+
+        def create():
+            rel = entry.get().strip().lstrip("/")
+            if not rel:
+                return
+            path = os.path.join(tab.root, rel)
+            try:
+                os.makedirs(path, exist_ok=True)
+                win.destroy()
+                self._scan_files(tab)
+                self._render_files(tab)
+            except OSError as e:
+                self.append_chat(f"❌ Failed to create folder: {e}", tag="error")
+
+        entry.bind("<Return>", lambda _e: create())
+        btns = ctk.CTkFrame(win, fg_color="transparent")
+        btns.pack(fill="x", padx=20, pady=4)
+        ctk.CTkButton(btns, text="Cancel", width=80, height=28, fg_color=CARD,
+                      hover_color=ACTIVE, text_color=TEXT, command=win.destroy).pack(side="left")
+        ctk.CTkButton(btns, text="Create Folder", width=110, height=28, fg_color=GOLD,
+                      text_color="#000", hover_color="#FFB300", font=ctk.CTkFont(weight="bold"),
+                      command=create).pack(side="right")
 
     # -------------------------------------------------------- image --
     def upload_image(self):
@@ -3599,6 +4595,10 @@ class DevsoftIDE(ctk.CTk):
         or the thread-safe append_chat (same contract as the legacy path).
         """
         t = ev["evt"]
+        if t == "error":
+            msg = ev.get("message") or ev.get("error") or "Engine error"
+            self.append_chat(f"❌ {msg}", tag="error", tab=tab)
+            return
         if t == "intent":
             it = ev.get("intent") or ""
             labels = {"trivial": "💬 Greeting",
@@ -4315,26 +5315,75 @@ class DevsoftIDE(ctk.CTk):
             self._finish_tab_run(tab)
             return
 
-        if not self._wait_for_ollama(tab):
-            self._finish_tab_run(tab)
-            return
+        # Determine model and cloud provider
+        raw_model = tab.model
+        cloud_provider = None
+        if raw_model.startswith("groq:"):
+            cloud_provider = "groq"
+            actual_model = raw_model[len("groq:"):]
+        elif raw_model.startswith("openrouter:"):
+            cloud_provider = "openrouter"
+            actual_model = raw_model[len("openrouter:"):]
+        elif raw_model.startswith("gemini:"):
+            cloud_provider = "gemini"
+            actual_model = raw_model[len("gemini:"):]
+        elif raw_model.startswith("cerebras:"):
+            cloud_provider = "cerebras"
+            actual_model = raw_model[len("cerebras:"):]
+        elif raw_model.startswith("cloud:"):
+            cloud_provider = "cloud"
+            actual_model = raw_model[len("cloud:"):]
+        else:
+            actual_model = raw_model
+            configured_provider = self.settings.get("provider", "ollama")
+            if configured_provider in ("groq", "openrouter", "gemini", "cerebras", "cloud", "generic_cloud"):
+                cloud_provider = "cloud" if configured_provider == "generic_cloud" else configured_provider
+
+        # Check API key if cloud provider is active
+        api_key = ""
+        if cloud_provider:
+            key_setting = f"{cloud_provider}_api_key"
+            api_key = (self.settings.get(key_setting) or self.settings.get("api_key") or
+                       os.environ.get(f"{cloud_provider.upper()}_API_KEY") or
+                       os.environ.get("CLOUD_API_KEY") or "")
+            if not api_key:
+                preset = CLOUD_PRESETS.get(cloud_provider, {})
+                hint_url = preset.get("portal_url") or "https://console.groq.com/keys"
+                self.append_chat(
+                    f"⚠️ Free API Key Needed for {cloud_provider.title()}:\n"
+                    f"1. Grab your free key at: {hint_url}\n"
+                    f"2. Click ⚙ Settings in the top bar, paste your key, and click Save.",
+                    tag="error", tab=tab)
+                self._finish_tab_run(tab)
+                return
+        else:
+            if not self._wait_for_ollama(tab):
+                self._finish_tab_run(tab)
+                return
 
         s = self.settings
         mode = getattr(tab, "execution_mode", "fast")
         mode_label = "⚡ Fast Mode (Direct Execution)" if mode == "fast" else "🧠 Architect Mode (Plan → Execute → Verify)"
-        self.append_chat(f"◆ Engine ready · {tab.model} · {mode_label}",
+        prov_label = f"⚡ {cloud_provider.title()} Cloud" if cloud_provider else "💻 Local Ollama"
+        self.append_chat(f"◆ Engine ready · {prov_label} · {actual_model} · {mode_label}",
                          tag="system", tab=tab)
-        cmd = [py, "-u", AGENT_SCRIPT, tab.root, "--model", tab.model, "--yolo", "--events"]
+        cmd = [py, "-u", AGENT_SCRIPT, tab.root, "--model", actual_model, "--yolo", "--events"]
 
         if mode == "fast":
             cmd += ["--fast", "--no-plan", "--no-mission"]
         else:
             cmd += ["--mission", "--plan"]
 
-        # Add provider flag based on settings
-        provider = s.get("provider", "ollama")
-        if provider:
-            cmd += ["--provider", provider]
+        if cloud_provider:
+            cmd += ["--provider", cloud_provider]
+            if api_key:
+                cmd += ["--api-key", api_key]
+            if cloud_provider == "cloud" and s.get("cloud_base_url"):
+                cmd += ["--base-url", s["cloud_base_url"]]
+        else:
+            provider = s.get("provider", "ollama")
+            if provider:
+                cmd += ["--provider", provider]
 
         if s.get("num_ctx"):
             cmd += ["--num-ctx", str(int(s["num_ctx"]))]
@@ -4353,6 +5402,9 @@ class DevsoftIDE(ctk.CTk):
             cmd += ["--resume", tab.session_id]
         cmd += ["-p", full_goal]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
+        if api_key and cloud_provider:
+            env[f"{cloud_provider.upper()}_API_KEY"] = api_key
+            env["CLOUD_API_KEY"] = api_key
         if s.get("ollama_host"):
             env["OLLAMA_HOST"] = s["ollama_host"]
         try:
@@ -4394,7 +5446,8 @@ class DevsoftIDE(ctk.CTk):
                 self.append_chat(f"⚠️ Engine exited with code {tab.proc.returncode}.",
                                  tag="error", tab=tab)
             else:
-                self.append_chat("✓ Run finished.", tag="success", tab=tab)
+                elapsed = time.time() - getattr(tab, "run_started", time.time())
+                self._render_run_summary(tab, elapsed=elapsed)
         except Exception as e:
             self.append_chat(f"❌ Engine error: {e}", tag="error", tab=tab)
         finally:
@@ -4411,6 +5464,54 @@ class DevsoftIDE(ctk.CTk):
                 self._start_agent_thread(tab, nxt)
             else:
                 self._finish_tab_run(tab)
+
+    def _render_run_summary(self, tab, elapsed=0.0):
+        # Gather changed files from git
+        _code, out = self._git(tab, "status", "--porcelain")
+        changed = []
+        if _code == 0:
+            for l in out.splitlines():
+                if l.strip():
+                    st, path = l[:2].strip(), l[3:].strip().strip('"')
+                    changed.append((st, path))
+
+        pt = getattr(tab, "last_prompt_tokens", 0)
+        gt = getattr(tab, "last_gen_tokens", 0)
+        mode = getattr(tab, "execution_mode", "fast")
+        mode_str = "⚡ Fast Mode" if mode == "fast" else "🧠 Architect Mode"
+
+        lines = [
+            "╔══════════════════════════════════════════════════════════════════════╗",
+            f"║  ✦ ANTIGRAVITY EXECUTION SUMMARY · {mode_str:<32} ║",
+            "╠══════════════════════════════════════════════════════════════════════╣",
+            f"║  Status:    ✅ Task Execution Complete",
+            f"║  Model:     {tab.model}",
+            f"║  Duration:  {elapsed:.1f}s · Tokens: {pt} prompt / {gt} gen",
+        ]
+
+        if changed:
+            lines.append("║")
+            lines.append(f"║  📁 Modified / Created Files ({len(changed)}):")
+            for st, path in changed[:10]:
+                icon = "📝" if st == "M" else ("📄" if st in ("A", "??") else "🗑️")
+                lines.append(f"║    {icon} [{st}] {path}")
+            if len(changed) > 10:
+                lines.append(f"║    … and {len(changed) - 10} more files")
+        else:
+            lines.append("║")
+            lines.append("║  📁 Workspace: Clean (all modifications committed or verified)")
+
+        lines.extend([
+            "║",
+            "║  💡 Next Steps:",
+            "║    • Review changes in 'Changes' tab or diff viewer",
+            "║    • Run automated test suite with '🧪 Run tests'",
+            "║    • Commit changes with '✓ Commit' in the Git tab",
+            "╚══════════════════════════════════════════════════════════════════════╝"
+        ])
+
+        summary_text = "\n".join(lines)
+        self.append_chat(summary_text, tag="summary", tab=tab)
 
     def _adopt_newest_session(self, tab):
         root = os.path.join(tab.root, ".agent_sessions")
