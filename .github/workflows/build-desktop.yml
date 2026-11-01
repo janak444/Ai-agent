@@ -1,0 +1,37 @@
+name: Build Desktop App
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - os: macos-latest
+            artifact: Devsoft-Agentic-IDE-macOS
+          - os: windows-latest
+            artifact: Devsoft-Agentic-IDE-Windows
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install customtkinter httpx2 pillow ollama pyinstaller
+
+      - name: Build with PyInstaller
+        run: pyinstaller Devsoft-Agentic.spec
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/

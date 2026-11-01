@@ -2,7 +2,7 @@ import httpx2
 import json
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
-MODEL = "llama3.2:latest" # Using a common model for testing
+MODEL = "qwen3.8:27b-mtp-q4_K_M" # Using installed local model
 
 def test_connection():
     print(f"🧪 Testing connection to Ollama with model: {MODEL}...")

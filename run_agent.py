@@ -1,7 +1,18 @@
 import os
+import sys
 import glob
 import json
-import httpx2
+
+try:
+    import httpx2
+except ImportError:
+    _here = os.path.dirname(os.path.abspath(__file__))
+    _venv_py = os.path.join(_here, "agent-env", "bin", "python3")
+    if not os.path.exists(_venv_py):
+        _venv_py = os.path.join(_here, "agent-env", "Scripts", "python.exe")
+    if os.path.exists(_venv_py) and os.path.abspath(sys.executable) != os.path.abspath(_venv_py):
+        os.execv(_venv_py, [_venv_py] + sys.argv)
+    raise
 
 OLLAMA_URL = "http://localhost:11434/api/chat"
 
@@ -9,6 +20,24 @@ def scan_workspace():
     """Scans the local desktop folder to list available codebase fragments."""
     files = [f for f in glob.glob("*") if os.path.isfile(f) and f != "run_agent.py"]
     return files
+
+def get_available_models():
+    """Dynamically queries Ollama for available models or falls back to defaults."""
+    try:
+        with httpx2.Client(timeout=5.0) as client:
+            r = client.get("http://localhost:11434/api/tags")
+            if r.status_code == 200:
+                models = [m.get("name") for m in r.json().get("models", []) if m.get("name")]
+                if models:
+                    return {str(i + 1): name for i, name in enumerate(models)}
+    except Exception:
+        pass
+    return {
+        "1": "qwen3.8:27b-mtp-q4_K_M",
+        "2": "qwen3-coder:30b",
+        "3": "llava:latest",
+        "4": "deepseek-r1:latest",
+    }
 
 def prompt_local_model(model_name, task, history=None):
     """Sends the execution string to the selected local Ollama core with streaming enabled."""
@@ -19,9 +48,10 @@ def prompt_local_model(model_name, task, history=None):
         {
             "role": "system",
             "content": (
-                "You are an expert autonomous software engineer and data architect agent. "
-                "When building complex software systems, output the complete, functional python "
-                "source code enclosed inside a clean ```python markdown block."
+                "You are Antigravity, an expert autonomous software engineer and pair programming agent. "
+                "Respond with fast, precise, production-grade solutions. "
+                "When writing software or scripts, output complete, functional source code enclosed inside "
+                "clean markdown code blocks (e.g. ```python)."
             )
         }
     ]
@@ -33,8 +63,10 @@ def prompt_local_model(model_name, task, history=None):
         "model": model_name,
         "messages": messages,
         "stream": True,
+        "keep_alive": "60m",
         "options": {
-            "temperature": 0.2
+            "temperature": 0.1,
+            "num_ctx": 16384
         }
     }
 
@@ -55,22 +87,17 @@ def prompt_local_model(model_name, task, history=None):
     return full_response
 
 if __name__ == "__main__":
-    print("🤖 Waking up Multi-Model Local Agent Engine...")
+    print("🤖 Waking up Antigravity Local Agent Engine...")
 
-    # Strictly bound to the exact names verified in your ollama inventory list
-    models_inventory = {
-        "1": "qwen3-coder:30b",
-        "2": "deepseek-r1:latest",
-        "3": "freebuff-mimo:latest",
-        "4": "llama3.2:latest"
-    }
+    models_inventory = get_available_models()
 
     print("\n🗂️  Available Local Brain Options:")
     for key, name in models_inventory.items():
         print(f"  [{key}] {name}")
 
-    choice = input("\n👉 Select a model brain to run this step (1-4): ").strip()
-    selected_model = models_inventory.get(choice, "qwen3-coder:30b")
+    default_choice = "1"
+    choice = input(f"\n👉 Select a model brain to run this step (default: [{default_choice}] {models_inventory.get(default_choice, '')}): ").strip()
+    selected_model = models_inventory.get(choice if choice else default_choice, "qwen3.8:27b-mtp-q4_K_M")
 
     # Initialize session history
     session_history = []
