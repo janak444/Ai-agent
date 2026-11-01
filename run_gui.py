@@ -291,21 +291,23 @@ def _legacy_project_prefs_path(root):
 
 
 def _load_project_prefs(root):
+    prefs = {}
     try:
         with open(_project_prefs_local_path(root), encoding="utf-8") as f:
-            return json.load(f)
+            prefs = json.load(f)
     except (OSError, json.JSONDecodeError):
-        pass
-    try:
-        with open(_project_prefs_path(root), encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        pass
-    try:
-        with open(_legacy_project_prefs_path(root), encoding="utf-8") as f:
-            return json.load(f)
-    except (OSError, json.JSONDecodeError):
-        return {}
+        try:
+            with open(_project_prefs_path(root), encoding="utf-8") as f:
+                prefs = json.load(f)
+        except (OSError, json.JSONDecodeError):
+            try:
+                with open(_legacy_project_prefs_path(root), encoding="utf-8") as f:
+                    prefs = json.load(f)
+            except (OSError, json.JSONDecodeError):
+                prefs = {}
+    if isinstance(prefs, dict) and prefs.get("session_id") == "project_prefs":
+        prefs["session_id"] = None
+    return prefs
 
 
 def _save_project_prefs(root, prefs):
@@ -1315,13 +1317,17 @@ class DevsoftIDE(ctk.CTk):
         best = None
         if os.path.isdir(root):
             for fn in os.listdir(root):
-                if not fn.endswith(".json"):
+                if fn == "project_prefs.json" or not fn.endswith(".json"):
                     continue
                 try:
                     with open(os.path.join(root, fn), encoding="utf-8") as f:
                         data = json.load(f)
-                    updated = data.get("updated") or 0
+                    if not isinstance(data, dict) or "messages" not in data:
+                        continue
                     sid = data.get("id") or fn[:-5]
+                    if sid == "project_prefs":
+                        continue
+                    updated = data.get("updated") or 0
                     if best is None or updated > best[0]:
                         best = (updated, sid)
                 except (OSError, json.JSONDecodeError):
@@ -2666,12 +2672,16 @@ class DevsoftIDE(ctk.CTk):
         entries = []
         if os.path.isdir(root):
             for fn in os.listdir(root):
-                if not fn.endswith(".json"):
+                if fn == "project_prefs.json" or not fn.endswith(".json"):
                     continue
                 try:
                     with open(os.path.join(root, fn), encoding="utf-8") as f:
                         data = json.load(f)
+                    if not isinstance(data, dict) or "messages" not in data:
+                        continue
                     sid = data.get("id") or fn[:-5]
+                    if sid == "project_prefs":
+                        continue
                     entries.append((
                         data.get("updated") or 0,
                         sid,
@@ -2831,12 +2841,16 @@ class DevsoftIDE(ctk.CTk):
         entries = []
         if os.path.isdir(root):
             for fn in os.listdir(root):
-                if not fn.endswith(".json"):
+                if fn == "project_prefs.json" or not fn.endswith(".json"):
                     continue
                 try:
                     with open(os.path.join(root, fn), encoding="utf-8") as f:
                         data = json.load(f)
+                    if not isinstance(data, dict) or "messages" not in data:
+                        continue
                     sid = data.get("id") or fn[:-5]
+                    if sid == "project_prefs":
+                        continue
                     entries.append((data.get("updated") or 0, sid,
                                     data.get("name") or "untitled",
                                     len(data.get("messages") or [])))
@@ -4305,12 +4319,16 @@ class DevsoftIDE(ctk.CTk):
         tab = self.active_tab()
         if not tab:
             return
-        code, out = self._git(tab, "checkout", "--", ".")
-        self._git(tab, "clean", "-fd")
+        code, _ = self._git(tab, "rev-parse", "--verify", "HEAD")
+        if code == 0:
+            self._git(tab, "checkout", "--", ".")
+            self._git(tab, "clean", "-fd")
+            self.append_chat("↩ Reverted all working tree changes.", tag="system")
+        else:
+            self.append_chat("⚠️ Revert skipped: Project has no initial Git commits yet. Untracked files protected from deletion.", tag="system")
         self.refresh_changes_panel()
         self.refresh_git_panel()
         self._render_files(tab)
-        self.append_chat("↩ Reverted all working tree changes.", tag="system")
 
     def _select_change(self, path, status):
         tab = self.active_tab()
