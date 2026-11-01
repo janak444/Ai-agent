@@ -85,8 +85,8 @@ FREE_CLOUD_MODELS = {
     "openrouter:qwen/qwen-2.5-coder-32b-instruct:free": "⚡ OpenRouter: Qwen 2.5 Coder (Free)",
     "openrouter:deepseek/deepseek-r1:free": "⚡ OpenRouter: DeepSeek R1 (Free)",
     # Google Gemini (Google AI Studio Free Tier: 15 RPM, 1M context window)
-    "gemini:gemini-2.0-flash": "⚡ Gemini 2.0 Flash (Free · Google AI)",
-    "gemini:gemini-1.5-flash": "⚡ Gemini 1.5 Flash (Free · Google AI)",
+    "gemini:models/gemini-3.5-flash": "⚡ Gemini 3.5 Flash (Google AI · 1M Context)",
+    "gemini:models/gemini-3.5-flash-lite": "⚡ Gemini 3.5 Flash Lite (Google AI · Fast)",
     # Cerebras (Free Tier: 1M tokens/day at 1000+ tok/s)
     "cerebras:llama3.1-70b": "⚡ Cerebras: Llama 3.1 70B (Free · 1000 tok/s)",
 }
