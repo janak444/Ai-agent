@@ -81,9 +81,8 @@ FREE_CLOUD_MODELS = {
     "groq:openai/gpt-oss-120b": "⚡ Groq: GPT-OSS 120B (Free · Reasoning)",
     "groq:openai/gpt-oss-20b": "⚡ Groq: GPT-OSS 20B (Free · Fast)",
     # OpenRouter (Permanent Free Tier Models)
-    "openrouter:meta-llama/llama-3.3-70b-instruct:free": "⚡ OpenRouter: Llama 3.3 70B (Free)",
-    "openrouter:qwen/qwen-2.5-coder-32b-instruct:free": "⚡ OpenRouter: Qwen 2.5 Coder (Free)",
-    "openrouter:deepseek/deepseek-r1:free": "⚡ OpenRouter: DeepSeek R1 (Free)",
+    "openrouter:openrouter/free": "⚡ OpenRouter: Auto Best Free (Free Tier)",
+    "openrouter:cohere/north-mini-code:free": "⚡ OpenRouter: Cohere Code (Free Tier)",
     # Google Gemini (Google AI Studio Free Tier: 15 RPM, 1M context window)
     "gemini:models/gemini-3.5-flash": "⚡ Gemini 3.5 Flash (Google AI · 1M Context)",
     "gemini:models/gemini-3.5-flash-lite": "⚡ Gemini 3.5 Flash Lite (Google AI · Fast)",
