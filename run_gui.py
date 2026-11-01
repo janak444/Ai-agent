@@ -4607,7 +4607,9 @@ class DevsoftIDE(ctk.CTk):
                       "fast_build": "⚡ Fast Mode · Direct tool execution",
                       "plan": "🧭 Plan · analysis only (read-only)",
                       "build": "🔨 Build · plan → execute → verify"}
-            self.append_chat(labels.get(it, f"Mode: {it}"), tag="system", tab=tab)
+            self.append_terminal(labels.get(it, f"Mode: {it}"), tab)
+            if it in ("plan", "build") and getattr(tab, "execution_mode", "fast") == "architect":
+                self.append_chat(labels.get(it, f"Mode: {it}"), tag="system", tab=tab)
             return
         if t == "delta":
             self._stream_delta(tab, ev.get("text") or "")
@@ -4628,6 +4630,9 @@ class DevsoftIDE(ctk.CTk):
             return
         if t == "tool_start":
             name = ev.get("name") or "?"
+            if not hasattr(tab, "recent_tool_calls"):
+                tab.recent_tool_calls = []
+            tab.recent_tool_calls.append(name)
             args = (ev.get("args") or "").strip()
             step, total = ev.get("step"), ev.get("total")
             icon = {
@@ -4706,9 +4711,15 @@ class DevsoftIDE(ctk.CTk):
                 return
             def _fmt(n):
                 return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
-            self.append_chat(
-                f"📊 {_fmt(pt)} prompt + {_fmt(gt)} gen tokens · {calls} tool calls · {dur:.0f}s",
-                tag="system", tab=tab)
+            stats_text = f"⚡ {tab.model} · {_fmt(pt)} prompt / {_fmt(gt)} gen · {dur:.1f}s"
+            if hasattr(self, "status_bar"):
+                self.after(0, lambda: self.status_bar.configure(text=f"● Ready · {stats_text}"))
+            self.append_terminal(f"📊 {stats_text} · {calls} tool calls", tab)
+            # Only display metrics pill in chat when multi-step tools were executed
+            if calls > 0:
+                self.append_chat(
+                    f"📊 {_fmt(pt)} prompt + {_fmt(gt)} gen tokens · {calls} tool calls · {dur:.1f}s",
+                    tag="system", tab=tab)
             return
         if t == "usage":
             try:
@@ -5367,9 +5378,11 @@ class DevsoftIDE(ctk.CTk):
         s = self.settings
         mode = getattr(tab, "execution_mode", "fast")
         mode_label = "⚡ Fast Mode (Direct Execution)" if mode == "fast" else "🧠 Architect Mode (Plan → Execute → Verify)"
+        tab.recent_tool_calls = []
         prov_label = f"⚡ {cloud_provider.title()} Cloud" if cloud_provider else "💻 Local Ollama"
-        self.append_chat(f"◆ Engine ready · {prov_label} · {actual_model} · {mode_label}",
-                         tag="system", tab=tab)
+        self.append_terminal(f"◆ Engine ready · {prov_label} · {actual_model} · {mode_label}", tab)
+        if hasattr(self, "status_bar"):
+            self.after(0, lambda: self.status_bar.configure(text=f"● Running · {prov_label} · {actual_model}"))
         cmd = [py, "-u", AGENT_SCRIPT, tab.root, "--model", actual_model, "--yolo", "--events"]
 
         if mode == "fast":
@@ -5401,7 +5414,7 @@ class DevsoftIDE(ctk.CTk):
         else:
             cmd += ["--no-think"]
         if tab.session_id:
-            self.append_chat(f"↩ Resuming session {tab.session_id}", tag="system", tab=tab)
+            self.append_terminal(f"↩ Resuming session {tab.session_id}", tab)
             cmd += ["--resume", tab.session_id]
         cmd += ["-p", full_goal]
         env = {**os.environ, "PYTHONUNBUFFERED": "1"}
@@ -5482,6 +5495,30 @@ class DevsoftIDE(ctk.CTk):
         gt = getattr(tab, "last_gen_tokens", 0)
         mode = getattr(tab, "execution_mode", "fast")
         mode_str = "⚡ Fast Mode" if mode == "fast" else "🧠 Architect Mode"
+        tasks = list(getattr(tab, "tasks_data", []))
+        tools = list(getattr(tab, "recent_tool_calls", []))
+
+        # Update status bar quietly
+        def _fmt(n):
+            return f"{n / 1000:.1f}k" if n >= 1000 else str(n)
+        status_msg = f"○ Ready · {tab.model} · {elapsed:.1f}s"
+        if pt or gt:
+            status_msg += f" · {_fmt(pt)} prompt / {_fmt(gt)} gen"
+        if changed:
+            status_msg += f" · {len(changed)} files modified"
+        if hasattr(self, "status_bar"):
+            self.after(0, lambda: self.status_bar.configure(text=status_msg))
+
+        # The summary card is ONLY necessary when there are tasks to report,
+        # tools were executed, files modified, or in Architect mode!
+        # For simple chats/greetings without tasks or modifications, skip it completely.
+        has_tasks = len(tasks) > 0
+        has_tools = len(tools) > 0
+        has_changes = len(changed) > 0
+        is_architect = (mode == "architect")
+
+        if not (has_tasks or has_tools or has_changes or is_architect):
+            return
 
         lines = [
             "╔══════════════════════════════════════════════════════════════════════╗",
@@ -5492,6 +5529,17 @@ class DevsoftIDE(ctk.CTk):
             f"║  Duration:  {elapsed:.1f}s · Tokens: {pt} prompt / {gt} gen",
         ]
 
+        if tasks:
+            lines.append("║")
+            lines.append(f"║  📋 Tasks Executed ({len(tasks)}):")
+            for tsk in tasks[:8]:
+                title = tsk.get("title", "") if isinstance(tsk, dict) else str(tsk)
+                st = tsk.get("status", "done") if isinstance(tsk, dict) else "done"
+                icon = "✅" if st == "done" else ("⏳" if st == "in_progress" else "○")
+                lines.append(f"║    {icon} {title}")
+            if len(tasks) > 8:
+                lines.append(f"║    … and {len(tasks) - 8} more tasks")
+
         if changed:
             lines.append("║")
             lines.append(f"║  📁 Modified / Created Files ({len(changed)}):")
@@ -5500,9 +5548,9 @@ class DevsoftIDE(ctk.CTk):
                 lines.append(f"║    {icon} [{st}] {path}")
             if len(changed) > 10:
                 lines.append(f"║    … and {len(changed) - 10} more files")
-        else:
+        elif has_tools:
             lines.append("║")
-            lines.append("║  📁 Workspace: Clean (all modifications committed or verified)")
+            lines.append("║  📁 Workspace: Clean (tools executed without dirty working tree)")
 
         lines.extend([
             "║",
