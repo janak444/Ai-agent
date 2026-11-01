@@ -274,6 +274,10 @@ def _detect_ram_gb():
     return None
 
 
+def _project_prefs_local_path(root):
+    return os.path.join(root, ".agent_sessions", "project_prefs.json")
+
+
 def _project_prefs_path(root):
     # stable digest — plain hash() is randomized per process, which silently
     # broke prefs persistence across restarts (session_id, model)
@@ -288,6 +292,11 @@ def _legacy_project_prefs_path(root):
 
 def _load_project_prefs(root):
     try:
+        with open(_project_prefs_local_path(root), encoding="utf-8") as f:
+            return json.load(f)
+    except (OSError, json.JSONDecodeError):
+        pass
+    try:
         with open(_project_prefs_path(root), encoding="utf-8") as f:
             return json.load(f)
     except (OSError, json.JSONDecodeError):
@@ -300,6 +309,13 @@ def _load_project_prefs(root):
 
 
 def _save_project_prefs(root, prefs):
+    try:
+        loc = _project_prefs_local_path(root)
+        os.makedirs(os.path.dirname(loc), exist_ok=True)
+        with open(loc, "w", encoding="utf-8") as f:
+            json.dump(prefs, f, indent=2)
+    except OSError:
+        pass
     try:
         with open(_project_prefs_path(root), "w", encoding="utf-8") as f:
             json.dump(prefs, f, indent=2)
@@ -321,6 +337,16 @@ def _parse_event(line):
     if isinstance(obj, dict) and isinstance(obj.get("evt"), str):
         return obj
     return None
+
+
+def _is_loop_garbage(text: str) -> bool:
+    if len(text) < 200:
+        return False
+    for probe in (20, 28, 40):
+        head = text[:probe].strip()
+        if len(head.split()) >= 3 and text.count(head) >= 3:
+            return True
+    return False
 
 
 class Tooltip:
@@ -379,6 +405,7 @@ class ProjectTab:
         self.name = os.path.basename(self.root.rstrip("/")) or self.root
         self.model = "groq:qwen/qwen3.8-27b"
         self.session_id = None
+        self.explicit_new_chat = False
         self.session_labels = {}
         self.transcript = []
         self.tasks_data = []
@@ -1262,6 +1289,24 @@ class DevsoftIDE(ctk.CTk):
                                   command=lambda idx=i: self.close_tab(idx))
                 x.pack(side="left", padx=(0, 10))
 
+    def _find_newest_session(self, tab):
+        root = os.path.join(tab.root, ".agent_sessions")
+        best = None
+        if os.path.isdir(root):
+            for fn in os.listdir(root):
+                if not fn.endswith(".json"):
+                    continue
+                try:
+                    with open(os.path.join(root, fn), encoding="utf-8") as f:
+                        data = json.load(f)
+                    updated = data.get("updated") or 0
+                    sid = data.get("id") or fn[:-5]
+                    if best is None or updated > best[0]:
+                        best = (updated, sid)
+                except (OSError, json.JSONDecodeError):
+                    continue
+        return best[1] if best else None
+
     def add_project_tab(self, path):
         if not path:
             return
@@ -1276,22 +1321,30 @@ class DevsoftIDE(ctk.CTk):
             tab.model = prefs["model"]
         if prefs.get("session_id"):
             tab.session_id = prefs["session_id"]
+
+        # Validate persisted session or automatically adopt the newest session
+        if tab.session_id:
+            sess_path = os.path.join(tab.root, ".agent_sessions", f"{tab.session_id}.json")
+            if not os.path.isfile(sess_path):
+                tab.session_id = None
+
+        if not tab.session_id:
+            tab.session_id = self._find_newest_session(tab)
+            if tab.session_id:
+                _save_project_prefs(tab.root, {"model": tab.model, "session_id": tab.session_id})
+
+        # Pre-load tasks and transcript before activating so UI renders them immediately
+        if tab.session_id:
+            self._load_session_tasks(tab, tab.session_id)
+            self._load_session_transcript(tab, tab.session_id)
+
         self.tabs.append(tab)
         self.active_index = len(self.tabs) - 1
         self._activate_tab()
         self._scan_files(tab)
-        self.refresh_sessions(tab)
+        self.refresh_sessions(tab, keep_selection=True)
         self.render_tab_bar()
         self._remember_project(path)
-        # restore the saved chat + tasks for the persisted session (restart-proof)
-        if tab.session_id:
-            sess_path = os.path.join(tab.root, ".agent_sessions", f"{tab.session_id}.json")
-            if os.path.isfile(sess_path):
-                self._load_session_tasks(tab, tab.session_id)
-                self._load_session_transcript(tab, tab.session_id)
-            else:
-                tab.session_id = None
-                _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
 
     def _remember_project(self, path):
         recents = []
@@ -1895,6 +1948,17 @@ class DevsoftIDE(ctk.CTk):
         tab = self.active_tab()
         if not tab:
             return
+        # Ensure session transcript and tasks are loaded for this tab
+        if tab.session_id and not tab.transcript:
+            self._load_session_tasks(tab, tab.session_id)
+            self._load_session_transcript(tab, tab.session_id)
+        elif not tab.session_id and not getattr(tab, "explicit_new_chat", False):
+            newest = self._find_newest_session(tab)
+            if newest:
+                tab.session_id = newest
+                _save_project_prefs(tab.root, {"model": tab.model, "session_id": newest})
+                self._load_session_tasks(tab, tab.session_id)
+                self._load_session_transcript(tab, tab.session_id)
         self.project_label.configure(text=tab.name.upper()[:26])
         self.project_path_label.configure(text=tab.root)
         self.title(f"Devsoft-Agentic IDE — {tab.name}")
@@ -2470,6 +2534,7 @@ class DevsoftIDE(ctk.CTk):
     def _switch_to_session(self, tab, sid):
         if not tab:
             return
+        tab.explicit_new_chat = False
         tab.session_id = sid
         _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
         self._load_session_tasks(tab, sid)
@@ -2575,25 +2640,25 @@ class DevsoftIDE(ctk.CTk):
         if not tab:
             return
         if label == "(new chat)":
+            tab.explicit_new_chat = True
             tab.session_id = None
+            tab.transcript.clear()
+            tab.tasks_data = []
             _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
+            self.refresh_tasks_panel()
+            self._render_transcript(tab)
+            self._render_sessions_list(tab)
             return
         sid = tab.session_labels.get(label)
         if sid:
+            tab.explicit_new_chat = False
             tab.session_id = sid
             _save_project_prefs(tab.root, {"model": tab.model, "session_id": sid})
             self._load_session_tasks(tab, sid)
             self._load_session_transcript(tab, sid)
+            self._render_sessions_list(tab)
 
-    @staticmethod
-    def _is_loop_garbage(text: str) -> bool:
-        if len(text) < 200:
-            return False
-        for probe in (20, 28, 40):
-            head = text[:probe].strip()
-            if len(head.split()) >= 3 and text.count(head) >= 3:
-                return True
-        return False
+    _is_loop_garbage = staticmethod(_is_loop_garbage)
 
     def _load_session_transcript(self, tab, sid):
         path = os.path.join(tab.root, ".agent_sessions", f"{sid}.json")
@@ -2607,7 +2672,7 @@ class DevsoftIDE(ctk.CTk):
         for m in messages:
             role = m.get("role", "")
             content = (m.get("content") or "").strip()
-            if not content:
+            if not content and not m.get("tool_calls"):
                 continue
             if role == "system":
                 continue
@@ -2618,9 +2683,7 @@ class DevsoftIDE(ctk.CTk):
                     for tc in m["tool_calls"]:
                         fn = tc.get("function", {})
                         entries.append(("activity", f"🔧 {fn.get('name', '?')} {str(fn.get('arguments', ''))[:120]}"))
-                elif self._is_loop_garbage(content):
-                    continue
-                elif content:
+                if content and not _is_loop_garbage(content):
                     entries.append(("assistant", content))
             elif role == "tool":
                 short = content[:200].replace("\n", " ")
@@ -2844,12 +2907,15 @@ class DevsoftIDE(ctk.CTk):
             self.append_chat("⏳ Finish or stop the current run before starting a new chat.",
                              tag="system")
             return
+        tab.explicit_new_chat = True
         tab.session_id = None
         tab.transcript.clear()
         tab.tasks_data = []
+        _save_project_prefs(tab.root, {"model": tab.model, "session_id": None})
         self.refresh_tasks_panel()
         self._render_transcript(tab)
         self.sessions_dropdown.set("(new chat)")
+        self._render_sessions_list(tab)
 
     # -------------------------------------------------------- files/editor --
     def _scan_files(self, tab):
@@ -5176,6 +5242,7 @@ class DevsoftIDE(ctk.CTk):
         self._start_agent_thread(tab, full_task, display_task=display_task)
 
     def _start_agent_thread(self, tab, task, display_task=None):
+        tab.explicit_new_chat = False
         self.append_chat(display_task or task, tag="goal", tab=tab)
         tab.is_generating = True
         tab.stop_requested = False
@@ -5550,23 +5617,10 @@ class DevsoftIDE(ctk.CTk):
         self.append_chat(summary_text, tag="summary", tab=tab)
 
     def _adopt_newest_session(self, tab):
-        root = os.path.join(tab.root, ".agent_sessions")
-        best = None
-        if os.path.isdir(root):
-            for fn in os.listdir(root):
-                if not fn.endswith(".json"):
-                    continue
-                try:
-                    with open(os.path.join(root, fn), encoding="utf-8") as f:
-                        data = json.load(f)
-                    updated = data.get("updated") or 0
-                    sid = data.get("id") or fn[:-5]
-                    if best is None or updated > best[0]:
-                        best = (updated, sid)
-                except (OSError, json.JSONDecodeError):
-                    continue
-        if best:
-            tab.session_id = best[1]
+        newest = self._find_newest_session(tab)
+        if newest:
+            tab.session_id = newest
+            _save_project_prefs(tab.root, {"model": tab.model, "session_id": newest})
             if tab is self.active_tab():
                 self.after(0, lambda: self.refresh_sessions(tab, keep_selection=True))
 
