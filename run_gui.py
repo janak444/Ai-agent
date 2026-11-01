@@ -741,11 +741,28 @@ class DevsoftIDE(ctk.CTk):
         self.tools_badge.grid(row=0, column=3, padx=(4, 0))
         self._update_tools_badge()
 
+        self.copy_chat_btn = ctk.CTkButton(chat_hdr, text="📋 Copy Chat", width=85, height=24,
+                                           fg_color=CARD, hover_color=ACTIVE, text_color=TEXT,
+                                           font=ctk.CTkFont(size=11), command=self.copy_entire_chat)
+        self.copy_chat_btn.grid(row=0, column=4, padx=(8, 0))
+        Tooltip(self.copy_chat_btn, "Copy entire conversation transcript to clipboard")
+
         self.chat_display = ctk.CTkTextbox(self.chat_tab, fg_color="#0E0E0E", text_color=TEXT,
                                            wrap="word", font=ctk.CTkFont(size=13))
         self.chat_display.grid(row=1, column=0, sticky="nsew")
         self.chat_display.configure(state="disabled")
         self._setup_chat_tags()
+
+        # Keyboard shortcuts and context menu for copying responses
+        tb_chat = self.chat_display._textbox
+        tb_chat.bind("<Command-c>", self._on_chat_copy, add="+")
+        tb_chat.bind("<Control-c>", self._on_chat_copy, add="+")
+        tb_chat.bind("<<Copy>>", self._on_chat_copy, add="+")
+        tb_chat.bind("<Command-a>", self._on_chat_select_all, add="+")
+        tb_chat.bind("<Control-a>", self._on_chat_select_all, add="+")
+        tb_chat.bind("<Button-2>", self._show_chat_context_menu, add="+")
+        tb_chat.bind("<Button-3>", self._show_chat_context_menu, add="+")
+        tb_chat.bind("<Control-Button-1>", self._show_chat_context_menu, add="+")
 
         self.welcome_frame = ctk.CTkFrame(self.chat_tab, fg_color="#0E0E0E", corner_radius=0)
         self.welcome_frame.grid(row=1, column=0, sticky="nsew")
@@ -1178,6 +1195,10 @@ class DevsoftIDE(ctk.CTk):
         self.user_input.bind("<FocusOut>", self._on_input_focus_out, add="+")
         self.user_input._textbox.bind("<Button-1>", self._on_input_click, add="+")
         self.user_input.bind("<Command-v>", self._on_input_paste, add="+")
+        self.user_input.bind("<Control-v>", self._on_input_paste, add="+")
+        self.user_input._textbox.bind("<Button-2>", self._show_input_context_menu, add="+")
+        self.user_input._textbox.bind("<Button-3>", self._show_input_context_menu, add="+")
+        self.user_input._textbox.bind("<Control-Button-1>", self._show_input_context_menu, add="+")
         input_wrap.bind("<Button-1>", lambda _e: self.user_input.focus_set())
         self.input_hint = ctk.CTkLabel(input_wrap,
                                        text="Ask Antigravity to build, edit, or fix…   "
@@ -2228,12 +2249,18 @@ class DevsoftIDE(ctk.CTk):
         try:
             if tag == "goal":
                 if show_header:
-                    tb.insert("end", "\n👤 You\n", "user_hdr")
+                    goal_id = f"u_{abs(hash(text)) % 10000000}"
+                    tb.insert("end", "\n👤 You  ", "user_hdr")
+                    tb.insert("end", "[📋 Copy]\n", ("copy_btn", goal_id))
+                    tb.tag_bind(goal_id, "<Button-1>", lambda _e, c=text: self._copy_to_clipboard(c))
                 self._insert_markdown(text, "goal")
                 tb.insert("end", "\n")
             elif tag in ("assistant", None):
                 if show_header and not (tb.get("end-2c linestart", "end-1c").startswith("◈")):
-                    tb.insert("end", "\n◈ Devsoft Agent\n", "asst_hdr")
+                    asst_id = f"a_{abs(hash(text)) % 10000000}"
+                    tb.insert("end", "\n◈ Devsoft Agent  ", "asst_hdr")
+                    tb.insert("end", "[📋 Copy]\n", ("copy_btn", asst_id))
+                    tb.tag_bind(asst_id, "<Button-1>", lambda _e, c=text: self._copy_to_clipboard(c))
                 self._insert_markdown(text, "assistant")
                 tb.insert("end", "\n")
             elif tag == "tool_start":
@@ -2251,7 +2278,7 @@ class DevsoftIDE(ctk.CTk):
             elif tag == "observation":
                 tb.insert("end", f"{text.strip()}\n", "observation")
             elif tag == "error":
-                tb.insert("end", f"  ❌ {text.strip()}\n", "error")
+                self._render_diagnostic_card(tb, text)
             elif tag == "success":
                 tb.insert("end", f"  ✓ {text.strip()}\n", "success")
             elif tag == "summary":
@@ -2262,6 +2289,198 @@ class DevsoftIDE(ctk.CTk):
             self.chat_display.configure(state="disabled")
         try:
             self.chat_display.see("end")
+        except Exception:
+            pass
+
+    # ---------------------------------------------------- debugging & copy --
+    def _analyze_error(self, err_text: str, tab=None):
+        lower = err_text.lower()
+        if "413" in err_text or "rate_limit_exceeded" in lower or "limit 7000" in lower or "too large" in lower:
+            return {
+                "title": "Groq Cloud Token Rate Limit (413 ITPM)",
+                "reason": "Groq Cloud free tier limits `qwen/qwen3.8-27b` to 7,000 input tokens/min. This request reached that limit.",
+                "solution": "• Switch to Google Gemini 3.5 Flash (1M tokens free with your configured API key).\n• Or use OpenRouter Free.\n• Sliding window auto-compaction has also been enabled for future turns.",
+                "can_switch_gemini": True,
+            }
+        if "401" in err_text or "unauthorized" in lower or "invalid api key" in lower:
+            return {
+                "title": "Authentication Failed (401)",
+                "reason": "The cloud model API key was rejected, missing, or expired.",
+                "solution": "• Open Settings (⚙ icon in tab bar) and verify your API key.\n• Check that your provider key has active credits/quota.",
+                "can_switch_gemini": False,
+            }
+        if "429" in err_text or "quota" in lower:
+            return {
+                "title": "Provider Rate Limit Reached (429)",
+                "reason": "Too many requests were sent within a short window, or the daily free quota was reached.",
+                "solution": "• Wait 30-60 seconds before retrying.\n• Switch to Gemini 3.5 Flash or OpenRouter in the model dropdown.",
+                "can_switch_gemini": True,
+            }
+        if "connection failed" in lower or "nodename nor servname" in lower or "connecterror" in lower:
+            return {
+                "title": "Connection / DNS Failure",
+                "reason": "Could not connect to the cloud model endpoint.",
+                "solution": "• Check your internet connection.\n• If using local Ollama, make sure 'ollama serve' is running.",
+                "can_switch_gemini": False,
+            }
+        return {
+            "title": "Engine Execution Error",
+            "reason": err_text[:220].strip(),
+            "solution": "• Click '[🔍 View Terminal Logs]' below to inspect full process logs and stack trace.\n• Try rephrasing or running with direct execution mode.",
+            "can_switch_gemini": False,
+        }
+
+    def _render_diagnostic_card(self, tb, err_text: str, tab=None):
+        tab = tab or self.active_tab()
+        info = self._analyze_error(err_text, tab)
+        err_id = f"err_{abs(hash(err_text)) % 10000000}"
+
+        card_lines = [
+            "╔══════════════════════════════════════════════════════════════════════╗",
+            f"║  ❌ ERROR DIAGNOSTIC: {info['title'][:55]}",
+            "╠══════════════════════════════════════════════════════════════════════╣",
+            "║  🔍 What happened:",
+            f"║     {info['reason'][:64]}",
+            "║",
+            "║  💡 How to fix it:",
+        ]
+        for s_line in info['solution'].splitlines():
+            card_lines.append(f"║     {s_line}")
+        card_lines.append("╚══════════════════════════════════════════════════════════════════════╝")
+
+        card_text = "\n".join(card_lines)
+        tb.insert("end", f"\n{card_text}\n", "error")
+
+        tb.insert("end", "  Actions: ", "system")
+        if info.get("can_switch_gemini"):
+            gem_id = f"gem_{err_id}"
+            tb.insert("end", "[⚡ Switch to Gemini Flash (1M Context)]  ", ("copy_btn", gem_id))
+            tb.tag_bind(gem_id, "<Button-1>", lambda _e, t=tab: self._auto_switch_to_gemini(t))
+
+        copy_err_id = f"cp_{err_id}"
+        tb.insert("end", "[📋 Copy Debug Info]  ", ("copy_btn", copy_err_id))
+        debug_payload = (
+            f"Error: {err_text}\n"
+            f"Model: {tab.model if tab else 'unknown'}\n"
+            f"Diagnosis: {info['title']}\n"
+            f"Reason: {info['reason']}\n"
+            f"Solution:\n{info['solution']}"
+        )
+        tb.tag_bind(copy_err_id, "<Button-1>", lambda _e, p=debug_payload: self._copy_to_clipboard(p))
+
+        term_id = f"term_{err_id}"
+        tb.insert("end", "[🔍 View Terminal Logs]\n\n", ("copy_btn", term_id))
+        tb.tag_bind(term_id, "<Button-1>", lambda _e: self.main_tabs.set("Terminal"))
+
+    def _auto_switch_to_gemini(self, tab=None):
+        tab = tab or self.active_tab()
+        if not tab:
+            return
+        gemini_model = "gemini:models/gemini-3.5-flash"
+        tab.model = gemini_model
+        _save_project_prefs(tab.root, {"model": tab.model, "session_id": tab.session_id})
+        self.model_badge.configure(text=tab.model)
+        display = self.models_inventory.get(gemini_model, gemini_model)
+        if display in list(self.model_dropdown.cget("values")):
+            self.model_dropdown.set(display)
+        self.status_bar.configure(text=f"✓ Switched to {gemini_model} (1M context window)", text_color=GREEN)
+        self.append_chat(f"⚡ Switched model to **{gemini_model}** (1M token context window). You can now re-run your prompt!", tag="system", tab=tab)
+
+    def _on_chat_copy(self, _event=None):
+        tb = self.chat_display._textbox
+        try:
+            sel_text = tb.get("sel.first", "sel.last")
+            if sel_text:
+                self._copy_to_clipboard(sel_text)
+                return "break"
+        except Exception:
+            pass
+        tab = self.active_tab()
+        if tab and tab.transcript:
+            for tag, text in reversed(tab.transcript):
+                if tag in ("assistant", None):
+                    self._copy_to_clipboard(text)
+                    return "break"
+        return None
+
+    def _on_chat_select_all(self, _event=None):
+        tb = self.chat_display._textbox
+        tb.tag_add("sel", "1.0", "end")
+        return "break"
+
+    def _show_chat_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT, activebackground=ACTIVE, activeforeground=GOLD)
+        tb = self.chat_display._textbox
+        has_sel = False
+        try:
+            if tb.tag_ranges("sel"):
+                has_sel = True
+        except Exception:
+            pass
+        if has_sel:
+            menu.add_command(label="📋 Copy Selection", command=self._on_chat_copy)
+        menu.add_command(label="📋 Copy Entire Chat", command=self.copy_entire_chat)
+        menu.add_command(label="✓ Select All", command=lambda: tb.tag_add("sel", "1.0", "end"))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _show_input_context_menu(self, event):
+        menu = tk.Menu(self, tearoff=0, bg=CARD, fg=TEXT, activebackground=ACTIVE, activeforeground=GOLD)
+        menu.add_command(label="📋 Paste", command=self._do_input_paste)
+        has_sel = False
+        try:
+            if self.user_input._textbox.tag_ranges("sel"):
+                has_sel = True
+        except Exception:
+            pass
+        if has_sel:
+            menu.add_command(label="📋 Copy", command=lambda: self._copy_to_clipboard(self.user_input._textbox.get("sel.first", "sel.last")))
+            menu.add_command(label="✂ Cut", command=self._do_input_cut)
+        menu.add_command(label="✓ Select All", command=lambda: self.user_input._textbox.tag_add("sel", "1.0", "end"))
+        menu.add_command(label="🧹 Clear", command=lambda: (self.user_input.delete("1.0", "end"), self._refresh_input_hint()))
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _do_input_cut(self):
+        try:
+            tb = self.user_input._textbox
+            sel = tb.get("sel.first", "sel.last")
+            if sel:
+                self._copy_to_clipboard(sel)
+                tb.delete("sel.first", "sel.last")
+                self._refresh_input_hint()
+                self._grow_input()
+        except Exception:
+            pass
+
+    def _do_input_paste(self):
+        try:
+            clip = self.clipboard_get()
+            if clip:
+                self.user_input.insert("insert", clip)
+                self._refresh_input_hint()
+                self._grow_input()
+        except Exception:
+            pass
+
+    def copy_entire_chat(self):
+        try:
+            tab = self.active_tab()
+            if not tab or not tab.transcript:
+                self._copy_to_clipboard("(empty conversation)")
+                return
+            lines = []
+            for tag, text in tab.transcript:
+                if tag == "goal":
+                    lines.append(f"👤 USER:\n{text}\n")
+                elif tag in ("assistant", None):
+                    lines.append(f"◈ ASSISTANT:\n{text}\n")
+                elif tag == "activity":
+                    lines.append(f"⚡ {text}")
+                elif tag == "error":
+                    lines.append(f"❌ ERROR:\n{text}\n")
+                elif tag == "system":
+                    lines.append(f"• {text}")
+            full = "\n".join(lines)
+            self._copy_to_clipboard(full)
         except Exception:
             pass
 
@@ -4602,6 +4821,15 @@ class DevsoftIDE(ctk.CTk):
         self.after(0, self._focus_input)
 
     def _on_input_paste(self, _event=None):
+        try:
+            text = self.clipboard_get()
+            if text:
+                self.user_input.insert("insert", text)
+                self._refresh_input_hint()
+                self._grow_input()
+                return "break"
+        except Exception:
+            pass
         try:
             from PIL import ImageGrab
             img = ImageGrab.grabclipboard()
