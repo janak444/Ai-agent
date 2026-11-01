@@ -86,8 +86,6 @@ FREE_CLOUD_MODELS = {
     # Google Gemini (Google AI Studio Free Tier: 15 RPM, 1M context window)
     "gemini:models/gemini-3.5-flash": "⚡ Gemini 3.5 Flash (Google AI · 1M Context)",
     "gemini:models/gemini-3.5-flash-lite": "⚡ Gemini 3.5 Flash Lite (Google AI · Fast)",
-    # Cerebras (Free Tier: 1M tokens/day at 1000+ tok/s)
-    "cerebras:llama3.1-70b": "⚡ Cerebras: Llama 3.1 70B (Free · 1000 tok/s)",
 }
 
 CLOUD_PRESETS = {
@@ -115,14 +113,6 @@ CLOUD_PRESETS = {
         "env_var": "GEMINI_API_KEY",
         "portal_url": "https://aistudio.google.com/apikey",
     },
-    "cerebras": {
-        "label": "⚡ Cerebras (Free 1M tok/day)",
-        "provider": "cerebras",
-        "base_url": "https://api.cerebras.ai/v1",
-        "key_setting": "cerebras_api_key",
-        "env_var": "CEREBRAS_API_KEY",
-        "portal_url": "https://cloud.cerebras.ai",
-    },
     "ollama": {
         "label": "💻 Ollama (Local Offline)",
         "provider": "ollama",
@@ -141,7 +131,6 @@ DEFAULT_SETTINGS = {
     "groq_api_key": "",
     "openrouter_api_key": "",
     "gemini_api_key": "",
-    "cerebras_api_key": "",
     "num_ctx": 16384,
     "temperature": 0.2,
     "keep_alive": "60m",
@@ -1596,7 +1585,6 @@ class DevsoftIDE(ctk.CTk):
             "⚡ Groq (Free · Ultra Fast 300-500 tok/s)",
             "⚡ OpenRouter (Free Tier Models)",
             "⚡ Google Gemini (Free AI Studio)",
-            "⚡ Cerebras (Free 1M tok/day)",
             "💻 Ollama (Local Offline)",
             "🌐 Custom OpenAI-compatible",
         ]
@@ -1604,7 +1592,6 @@ class DevsoftIDE(ctk.CTk):
             "⚡ Groq (Free · Ultra Fast 300-500 tok/s)": "groq",
             "⚡ OpenRouter (Free Tier Models)": "openrouter",
             "⚡ Google Gemini (Free AI Studio)": "gemini",
-            "⚡ Cerebras (Free 1M tok/day)": "cerebras",
             "💻 Ollama (Local Offline)": "ollama",
             "🌐 Custom OpenAI-compatible": "cloud",
         }
@@ -1663,7 +1650,6 @@ class DevsoftIDE(ctk.CTk):
         add_key_field(cloud_card, "Groq API Key (300+ tok/s free)", "groq_api_key", "https://console.groq.com/keys")
         add_key_field(cloud_card, "OpenRouter API Key (Free tier models)", "openrouter_api_key", "https://openrouter.ai/keys")
         add_key_field(cloud_card, "Google Gemini API Key (AI Studio 15 RPM)", "gemini_api_key", "https://aistudio.google.com/apikey")
-        add_key_field(cloud_card, "Cerebras API Key (1,000 tok/s free)", "cerebras_api_key", "https://cloud.cerebras.ai")
         add_key_field(cloud_card, "Custom / Other API Key", "api_key", "")
 
         # --- Section 2: Local & Engine Options ---
@@ -2274,7 +2260,7 @@ class DevsoftIDE(ctk.CTk):
                 installed = {m["name"].split(":")[0] for m in models}
                 self.models_meta = {m["name"]: m for m in models}
                 keep = {k: v for k, v in self.models_inventory.items()
-                        if k.startswith(("groq:", "openrouter:", "gemini:", "cerebras:", "cloud:"))
+                        if k.startswith(("groq:", "openrouter:", "gemini:", "cloud:"))
                         or k.split(":")[0] in installed}
                 for k, v in FREE_CLOUD_MODELS.items():
                     if k not in keep:
@@ -2314,7 +2300,7 @@ class DevsoftIDE(ctk.CTk):
 
     _TOOL_CAPABLE = ("qwen", "llama3.1", "llama3.2", "llama-3.3", "llama3.3", "mistral", "gemma2", "command-r",
                      "firefunction", "nexusrouter", "glm", "kimi", "minicpm", "phi3", "phi4",
-                     "groq", "gemini", "openrouter", "cerebras")
+                     "groq", "gemini", "openrouter")
 
     def _update_tools_badge(self):
         tab = self.active_tab()
@@ -5347,7 +5333,7 @@ class DevsoftIDE(ctk.CTk):
         else:
             actual_model = raw_model
             configured_provider = self.settings.get("provider", "ollama")
-            if configured_provider in ("groq", "openrouter", "gemini", "cerebras", "cloud", "generic_cloud"):
+            if configured_provider in ("groq", "openrouter", "gemini", "cloud", "generic_cloud"):
                 cloud_provider = "cloud" if configured_provider == "generic_cloud" else configured_provider
 
         # Check API key if cloud provider is active
